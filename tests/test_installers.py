@@ -22,6 +22,8 @@ class TestInstallersLifecycle(unittest.TestCase):
         self.env = os.environ.copy()
         self.env["HOME"] = self.temp_home
         self.env["USERPROFILE"] = self.temp_home
+        self.env["PYTHONUTF8"] = "1"
+        self.env["PYTHONIOENCODING"] = "utf-8"
 
     def tearDown(self):
         shutil.rmtree(self.temp_home, ignore_errors=True)
@@ -29,7 +31,7 @@ class TestInstallersLifecycle(unittest.TestCase):
     def test_install_and_uninstall_lifecycle(self):
         """测试 install.py 与 uninstall.py 完整闭环与产物验证"""
         # 1. 运行安装器 (无 --with-services)
-        res = subprocess.run([sys.executable, INSTALLER_PATH], capture_output=True, text=True, env=self.env)
+        res = subprocess.run([sys.executable, INSTALLER_PATH], capture_output=True, text=True, encoding="utf-8", errors="replace", env=self.env)
         self.assertEqual(res.returncode, 0, f"install.py 失败: {res.stderr}\n{res.stdout}")
         self.assertIn("安装部署全部完成", res.stdout)
 
@@ -48,7 +50,7 @@ class TestInstallersLifecycle(unittest.TestCase):
             self.assertTrue(os.path.islink(os.path.join(bin_dir, "mmx-switch")))
 
         # 3. 运行卸载器 (默认保留数据)
-        unres = subprocess.run([sys.executable, UNINSTALLER_PATH], capture_output=True, text=True, env=self.env)
+        unres = subprocess.run([sys.executable, UNINSTALLER_PATH], capture_output=True, text=True, encoding="utf-8", errors="replace", env=self.env)
         self.assertEqual(unres.returncode, 0, f"uninstall.py 失败: {unres.stderr}\n{unres.stdout}")
         self.assertIn("卸载完成", unres.stdout)
 
@@ -74,7 +76,7 @@ class TestInstallersLifecycle(unittest.TestCase):
         file_size_before = os.path.getsize(main_script)
 
         # 在 REPO_DIR 原地执行
-        res = subprocess.run([sys.executable, INSTALLER_PATH], cwd=REPO_DIR, capture_output=True, text=True, env=self.env)
+        res = subprocess.run([sys.executable, INSTALLER_PATH], cwd=REPO_DIR, capture_output=True, text=True, encoding="utf-8", errors="replace", env=self.env)
         self.assertEqual(res.returncode, 0)
 
         # 物理断言源码未被自噬
