@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+.DS_Store
+.env
+auth.json
+*.info
+*.tmp*
+auth_profiles/
