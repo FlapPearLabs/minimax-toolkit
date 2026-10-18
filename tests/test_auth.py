@@ -14,6 +14,7 @@ import base64
 import unittest
 import tempfile
 import shutil
+import stat
 import importlib.util
 
 REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -110,6 +111,76 @@ class TestAuthMechanisms(unittest.TestCase):
             mmx.AUTH_PROFILES_DIR = old_profiles_dir
             mmx.ACTIVE_AUTH_PATH = old_active_path
             shutil.rmtree(temp_home, ignore_errors=True)
+
+    def test_single_flight_file_lock_timeout_rejection(self):
+        """测试单飞排他锁在争用超时时严格抛出 TimeoutError，杜绝静默穿透降级"""
+        lock1 = mmx.SingleFlightFileLock(self.lock_path, timeout_sec=1.0)
+        lock2 = mmx.SingleFlightFileLock(self.lock_path, timeout_sec=0.2)
+        with lock1:
+            with self.assertRaises(TimeoutError):
+                with lock2:
+                    pass
+
+    def test_atomic_save_json_permissions_and_integrity(self):
+        """测试 atomic_save_json 0o600 权限落地（POSIX）与数据原子刷盘完整性"""
+        target_path = os.path.join(self.temp_dir, "secure_creds.json")
+        sample_data = {"key": "secret_val", "list": [1, 2, 3]}
+        mmx.atomic_save_json(target_path, sample_data)
+
+        self.assertTrue(os.path.exists(target_path))
+        loaded = mmx.load_json(target_path)
+        self.assertEqual(loaded, sample_data)
+
+        if sys.platform != "win32":
+            st = os.stat(target_path)
+            mode = stat.S_IMODE(st.st_mode)
+            self.assertEqual(mode, 0o600)
+
+    def test_alias_pattern_path_traversal_rejection(self):
+        """测试 get_profile_path 严格拒绝跨目录穿越与非法别名输入"""
+        invalid_aliases = [
+            "../evil",
+            "../../etc/passwd",
+            "acc/sub",
+            "acc\\sub",
+            "acc space",
+            "acc@123",
+            "a" * 65,
+            "",
+            "   "
+        ]
+        for inv in invalid_aliases:
+            with self.assertRaises(ValueError, msg=f"应该拒绝非法别名: {inv}"):
+                mmx.get_profile_path(inv)
+
+        valid_aliases = ["default", "work-1", "user_test_2", "Acc-09", "user.json"]
+        for v in valid_aliases:
+            path = mmx.get_profile_path(v)
+            self.assertTrue(path.endswith(".json"))
+
+    def test_sanitize_token_redaction(self):
+        """测试 sanitize_token 对长 Token、Bearer 串的脱敏遮蔽效果"""
+        raw_jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiIxMjM0NTYifQ.abcd1234efgh5678"
+        masked = mmx.sanitize_token(raw_jwt)
+        self.assertNotIn("abcd1234efgh5678", masked)
+        self.assertNotIn(raw_jwt, masked)
+        self.assertEqual(masked, "<REDACTED_TOKEN>")
+
+        log_line = f"Authorization: Bearer {raw_jwt}"
+        redacted = mmx.sanitize_token(log_line)
+        self.assertNotIn(raw_jwt, redacted)
+        self.assertIn("<REDACTED_TOKEN>", redacted)
+
+    def test_extract_account_meta_robustness(self):
+        """测试 extract_account_meta 对空数据、短 UID 及无 Demo UID 回退的物理防御"""
+        empty_meta = mmx.extract_account_meta({})
+        self.assertEqual(empty_meta["userName"], "(无记录)")
+        self.assertEqual(empty_meta["userId"], "(无记录)")
+        self.assertNotIn("508070720593346564", str(empty_meta))
+
+        meta_short = mmx.extract_account_meta({"userId": "123", "userName": "Alice"})
+        self.assertEqual(meta_short["userId"], "123")
+        self.assertEqual(meta_short["userName"], "Alice")
 
 if __name__ == "__main__":
     unittest.main()

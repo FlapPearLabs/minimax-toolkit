@@ -67,15 +67,20 @@ def install_cli():
         if not is_same_path(src_bin, dest_bin):
             shutil.copy2(src_bin, dest_bin)
 
-        # 写入 Windows CMD 垫片
+        # 写入 Windows CMD 垫片 (优先使用 py -3 / python3，避免 Windows Store 假别名)
         cmd_wrapper = (
             "@echo off\r\n"
             "setlocal\r\n"
-            "where python >nul 2>nul\r\n"
+            "where py >nul 2>nul\r\n"
             "if %ERRORLEVEL% equ 0 (\r\n"
-            "    python \"%~dp0minimax\" %*\r\n"
+            "    py -3 \"%~dp0minimax\" %*\r\n"
             ") else (\r\n"
-            "    py \"%~dp0minimax\" %*\r\n"
+            "    where python3 >nul 2>nul\r\n"
+            "    if %ERRORLEVEL% equ 0 (\r\n"
+            "        python3 \"%~dp0minimax\" %*\r\n"
+            "    ) else (\r\n"
+            "        python \"%~dp0minimax\" %*\r\n"
+            "    )\r\n"
             ")\r\n"
         )
         for name in ["minimax.cmd", "mmx.cmd"]:
@@ -88,7 +93,7 @@ def install_cli():
                 with open(os.path.join(bin_dir, prefix), "w", encoding="ascii") as f:
                     f.write(wrapper)
 
-        # 尝试配置 Windows PATH
+        # 尝试配置 Windows PATH (精确分项比对，杜绝子串误判)
         try:
             import winreg
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Environment", 0, winreg.KEY_READ | winreg.KEY_WRITE) as key:
@@ -96,7 +101,9 @@ def install_cli():
                     cur_path, _ = winreg.QueryValueEx(key, "Path")
                 except FileNotFoundError:
                     cur_path = ""
-                if bin_dir.lower() not in cur_path.lower():
+                parts = [p.strip() for p in cur_path.split(os.pathsep) if p.strip()]
+                norm_bin = os.path.normcase(bin_dir.rstrip('\\'))
+                if not any(os.path.normcase(p.rstrip('\\')) == norm_bin for p in parts):
                     new_path = f"{cur_path};{bin_dir}" if cur_path else bin_dir
                     winreg.SetValueEx(key, "Path", 0, winreg.REG_EXPAND_SZ, new_path)
                     print(f"{COLOR_GREEN}✔ 已将 {bin_dir} 添加至 Windows 用户 PATH 环境变量{COLOR_RESET}")
@@ -153,11 +160,14 @@ def install_services_if_requested(dest_bin):
     if sys.platform == "darwin":
         plist_src = os.path.join(SCRIPT_DIR, "launchd", "com.minimax.dailycheckin.plist")
         if os.path.exists(plist_src):
+            import xml.sax.saxutils
             plist_dest = os.path.join(HOME, "Library", "LaunchAgents", "com.minimax.dailycheckin.plist")
             os.makedirs(os.path.dirname(plist_dest), exist_ok=True)
             with open(plist_src, "r", encoding="utf-8") as f:
                 content = f.read()
-            content = content.replace("__CLI_PATH__", dest_bin).replace("__LOG_PATH__", os.path.join(LOGS_DIR, "checkin.log"))
+            escaped_dest = xml.sax.saxutils.escape(dest_bin, {'"': '&quot;', "'": '&apos;'})
+            escaped_log = xml.sax.saxutils.escape(os.path.join(LOGS_DIR, "checkin.log"), {'"': '&quot;', "'": '&apos;'})
+            content = content.replace("__CLI_PATH__", escaped_dest).replace("__LOG_PATH__", escaped_log)
             with open(plist_dest, "w", encoding="utf-8") as f:
                 f.write(content)
             subprocess.run(["launchctl", "unload", plist_dest], capture_output=True)

@@ -12,6 +12,7 @@ import os
 import sys
 import json
 import time
+import re
 import hashlib
 import urllib.parse
 import urllib.request
@@ -20,6 +21,7 @@ import secrets
 import base64
 import subprocess
 import webbrowser
+import xml.sax.saxutils
 from datetime import datetime, timezone, timedelta
 
 # -----------------------------------------------------------------------------
@@ -34,6 +36,10 @@ ACTIVE_AUTH_PATH = os.path.join(ACTIVE_AUTH_DIR, "auth.json")
 LOCK_FILE_PATH = os.path.join(MINIMAX_DIR, "auth", "token_refresh.lock")
 LOGS_DIR = os.path.join(MINIMAX_DIR, "logs")
 CHECKIN_LOG_PATH = os.path.join(LOGS_DIR, "checkin.log")
+
+# 安全校验与敏感词脱敏正则 (Zero-Leak)
+ALIAS_PATTERN = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
+REDACT_PATTERN = re.compile(r"(mmoat_[A-Za-z0-9_\-]+|mmort_[A-Za-z0-9_\-]+|eyJ[A-Za-z0-9_\-]{15,}\.[A-Za-z0-9_\-]{15,}\.[A-Za-z0-9_\-]+)")
 
 # OAuth 与网关端点
 TOKEN_ENDPOINT = "https://account.minimax.cn/oauth2/token"
@@ -76,76 +82,107 @@ COLOR_RESET = "\033[0m" if IS_TTY else ""
 # -----------------------------------------------------------------------------
 class SingleFlightFileLock:
     """跨平台文件排他锁，防止多进程同时使用相同 Refresh Token 触发服务重放风控"""
-    def __init__(self, lock_path):
+    def __init__(self, lock_path, timeout=30, timeout_sec=None):
         self.lock_path = lock_path
+        self.timeout = timeout if timeout_sec is None else timeout_sec
         self.fd = None
+        self._locked = False
 
     def __enter__(self):
-        os.makedirs(os.path.dirname(self.lock_path), exist_ok=True)
-        self.fd = open(self.lock_path, "w")
+        os.makedirs(os.path.dirname(os.path.abspath(self.lock_path)), exist_ok=True)
+        # 必须以 a+b 打开，严禁使用 "w" (会清空文件且破坏并发中的文件句柄)
+        self.fd = open(self.lock_path, "a+b")
+        start_time = time.time()
+
         if sys.platform == "win32":
-            try:
-                import msvcrt
-                start = time.time()
-                while time.time() - start < 10:
-                    try:
-                        msvcrt.locking(self.fd.fileno(), msvcrt.LK_NBLCK, 1)
-                        return self
-                    except (BlockingIOError, OSError):
-                        time.sleep(0.1)
-                msvcrt.locking(self.fd.fileno(), msvcrt.LK_LOCK, 1)
-            except Exception:
-                pass
+            import msvcrt
+            self.fd.seek(0)
+            while True:
+                try:
+                    msvcrt.locking(self.fd.fileno(), msvcrt.LK_NBLCK, 1)
+                    self._locked = True
+                    return self
+                except (BlockingIOError, OSError):
+                    if time.time() - start_time >= self.timeout:
+                        self.fd.close()
+                        self.fd = None
+                        raise TimeoutError(f"获取单飞文件排他锁超时 ({self.timeout}s): {self.lock_path}")
+                    time.sleep(0.1)
         else:
-            try:
-                import fcntl
-                fcntl.flock(self.fd, fcntl.LOCK_EX)
-            except Exception:
-                pass
-        return self
+            import fcntl
+            while True:
+                try:
+                    fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    self._locked = True
+                    return self
+                except (BlockingIOError, OSError):
+                    if time.time() - start_time >= self.timeout:
+                        self.fd.close()
+                        self.fd = None
+                        raise TimeoutError(f"获取单飞文件排他锁超时 ({self.timeout}s): {self.lock_path}")
+                    time.sleep(0.1)
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.fd:
             try:
-                if sys.platform == "win32":
-                    import msvcrt
-                    msvcrt.locking(self.fd.fileno(), msvcrt.LK_UNLCK, 1)
-                else:
-                    import fcntl
-                    fcntl.flock(self.fd, fcntl.LOCK_UN)
+                if self._locked:
+                    if sys.platform == "win32":
+                        import msvcrt
+                        self.fd.seek(0)
+                        msvcrt.locking(self.fd.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(self.fd, fcntl.LOCK_UN)
             except Exception:
                 pass
             finally:
-                self.fd.close()
+                try:
+                    self.fd.close()
+                except Exception:
+                    pass
                 self.fd = None
+                self._locked = False
 
 # -----------------------------------------------------------------------------
-# 基础日志与哈希工具
+# 基础日志与安全脱敏工具 (Zero-Leak)
 # -----------------------------------------------------------------------------
 def md5(s):
     return hashlib.md5(s.encode("utf-8")).hexdigest()
 
+def sanitize_token(text):
+    if not text:
+        return ""
+    return REDACT_PATTERN.sub("<REDACTED_TOKEN>", str(text))
+
 def log(msg, to_stdout=True, to_file=True):
     ts = datetime.now(TZ_SHANGHAI).strftime("%Y-%m-%d %H:%M:%S")
-    clean_msg = msg
+    clean_msg = sanitize_token(msg)
     for c in [COLOR_GREEN, COLOR_YELLOW, COLOR_CYAN, COLOR_RED, COLOR_BOLD, COLOR_DIM, COLOR_RESET]:
         clean_msg = clean_msg.replace(c, "")
     line = f"[{ts}] {clean_msg}"
     if to_file:
         try:
             os.makedirs(LOGS_DIR, exist_ok=True)
-            with open(CHECKIN_LOG_PATH, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
+            if sys.platform != "win32":
+                fd = os.open(CHECKIN_LOG_PATH, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+                with open(fd, "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+            else:
+                with open(CHECKIN_LOG_PATH, "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
         except Exception:
             pass
     if to_stdout:
-        print(msg)
+        print(sanitize_token(msg))
 
 def format_timestamp(ms):
     if not ms:
         return "未知"
-    dt = datetime.fromtimestamp(ms / 1000.0, tz=TZ_SHANGHAI)
-    return dt.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        dt = datetime.fromtimestamp(ms / 1000.0, tz=TZ_SHANGHAI)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return "未知"
 
 # -----------------------------------------------------------------------------
 # 凭据存储与管理 (严格落实 Sync-before-switch 与原子写防损铁律)
@@ -153,37 +190,73 @@ def format_timestamp(ms):
 def load_json(path):
     if not os.path.exists(path):
         return None
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        log(f"{COLOR_YELLOW}[警告]{COLOR_RESET} 解析 JSON 异常 ({path}): {e}", to_file=True, to_stdout=False)
+        return None
 
 def atomic_save_json(path, data):
-    """原子落盘：写入 .tmp.<pid> -> chmod 0600 -> os.replace，防止崩溃半截写"""
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    tmp_path = f"{path}.tmp.{os.getpid()}_{int(time.time()*1000)}"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-    try:
-        os.chmod(tmp_path, 0o600)
-    except Exception:
-        pass
-    os.replace(tmp_path, path)
+    """原子落盘：通过安全掩码创建临时文件 -> fsync 刷盘 -> 具备重试的原子替换"""
+    target_abs = os.path.abspath(path)
+    target_dir = os.path.dirname(target_abs)
+    os.makedirs(target_dir, exist_ok=True)
+    tmp_path = f"{target_abs}.tmp.{os.getpid()}_{secrets.token_hex(4)}"
+
+    if sys.platform != "win32":
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with open(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+        except Exception:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+            raise
+    else:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+
+    # 跨平台原子覆盖 (Windows 下防御杀毒软件短时独占句柄冲突)
+    for attempt in range(5):
+        try:
+            os.replace(tmp_path, target_abs)
+            break
+        except PermissionError:
+            if attempt == 4:
+                raise
+            time.sleep(0.05)
 
 def get_record_from_auth(auth_data):
-    if not auth_data:
+    if not auth_data or not isinstance(auth_data, dict):
         return None, None
     records = auth_data.get("records", {})
+    if not isinstance(records, dict):
+        return None, None
     for k, v in records.items():
-        if "accessToken" in v and "refreshToken" in v:
+        if isinstance(v, dict) and "accessToken" in v and "refreshToken" in v:
             return k, v
     return None, None
 
 def extract_account_meta(record):
     """从 Token 或 Record 中解析安全可展示的元数据 (脱敏)"""
-    if not record:
-        return {}
-    token = record.get("accessToken", "")
-    user_id = record.get("userId", "")
-    user_name = record.get("userName", "")
+    if not record or not isinstance(record, dict):
+        return {
+            "userId": "(无记录)",
+            "userName": "(无记录)",
+            "generation": 0,
+            "expiresAtMs": 0,
+            "loginEpoch": ""
+        }
+    token = record.get("accessToken", "") or ""
+    user_id = record.get("userId", "") or ""
+    user_name = record.get("userName", "") or ""
 
     if not user_id and token.startswith("ey"):
         parts = token.split(".")
@@ -192,45 +265,53 @@ def extract_account_meta(record):
                 padded = parts[1] + "=" * ((4 - len(parts[1]) % 4) % 4)
                 payload = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
                 user_info = payload.get("user", {})
-                user_id = user_info.get("id", "")
-                user_name = user_info.get("name", "")
+                user_id = user_info.get("id", "") or ""
+                user_name = user_info.get("name", "") or ""
             except Exception:
                 pass
     return {
-        "userId": user_id or "508070720593346564",
-        "userName": user_name or "MiniMax用户",
+        "userId": str(user_id) if user_id else "(未解析UID)",
+        "userName": str(user_name) if user_name else "MiniMax用户",
         "generation": record.get("generation", 1),
         "expiresAtMs": record.get("expiresAtMs", 0),
         "loginEpoch": record.get("loginEpoch", "")
     }
 
 def sync_active_to_profile():
-    """【铁律防御】切号前必须先将活跃凭据写回 Profile，防止覆盖运行期刷新的新 Token"""
+    """【铁律防御】切号前必须持锁先将活跃凭据写回 Profile，防止覆盖运行期刷新的新 Token"""
     if not os.path.exists(ACTIVE_AUTH_PATH):
         return
-    active_auth = load_json(ACTIVE_AUTH_PATH)
-    rec_key, rec = get_record_from_auth(active_auth)
-    if not rec:
-        return
+    with SingleFlightFileLock(LOCK_FILE_PATH):
+        active_auth = load_json(ACTIVE_AUTH_PATH)
+        rec_key, rec = get_record_from_auth(active_auth)
+        if not rec:
+            return
 
-    alias = active_auth.get("_toolkit_alias")
-    if not alias:
-        for p in list_profiles():
-            p_data = load_json(get_profile_path(p))
-            _, p_rec = get_record_from_auth(p_data)
-            if p_rec and p_rec.get("refreshToken") == rec.get("refreshToken"):
-                alias = p
-                break
-    if alias:
-        p_path = get_profile_path(alias)
-        profile_data = load_json(p_path) or {"schemaVersion": 1, "records": {}}
-        profile_data["records"][rec_key] = rec
-        profile_data["_toolkit_alias"] = alias
-        profile_data["_updated_at"] = int(time.time() * 1000)
-        atomic_save_json(p_path, profile_data)
+        alias = active_auth.get("_toolkit_alias")
+        if not alias:
+            for p in list_profiles():
+                p_data = load_json(get_profile_path(p))
+                _, p_rec = get_record_from_auth(p_data)
+                if p_rec and p_rec.get("refreshToken") == rec.get("refreshToken"):
+                    alias = p
+                    break
+        if alias:
+            p_path = get_profile_path(alias)
+            profile_data = load_json(p_path) or {"schemaVersion": 1, "records": {}}
+            if "records" not in profile_data:
+                profile_data["records"] = {}
+            profile_data["records"][rec_key] = rec
+            profile_data["_toolkit_alias"] = alias
+            profile_data["_updated_at"] = int(time.time() * 1000)
+            atomic_save_json(p_path, profile_data)
 
 def get_profile_path(alias):
-    clean = os.path.basename(alias).replace(".json", "")
+    raw_str = str(alias).strip()
+    if "/" in raw_str or "\\" in raw_str or ".." in raw_str:
+        raise ValueError(f"非法的账号别名 [{alias}]，禁止包含路径分隔符或父级引用")
+    clean = raw_str[:-5] if raw_str.endswith(".json") else raw_str
+    if not ALIAS_PATTERN.match(clean):
+        raise ValueError(f"非法的账号别名 [{alias}]，仅允许 1~64 位的英文字母、数字、下划线及减号")
     return os.path.join(AUTH_PROFILES_DIR, f"{clean}.json")
 
 def list_profiles():
@@ -276,19 +357,25 @@ def refresh_token_if_needed(auth_data, alias=None):
     now_ms = int(time.time() * 1000)
     expires_at = record.get("expiresAtMs", 0)
 
+    # 提前 5 分钟换新
     if now_ms + 300_000 < expires_at:
         return record["accessToken"], False
 
     with SingleFlightFileLock(LOCK_FILE_PATH):
+        # 锁内必须重新从磁盘加载 Profile，防止其他进程已先刷新完成
         if alias:
-            latest_profile = load_json(get_profile_path(alias))
+            p_path = get_profile_path(alias)
+            latest_profile = load_json(p_path)
             _, l_rec = get_record_from_auth(latest_profile)
             if l_rec and now_ms + 300_000 < l_rec.get("expiresAtMs", 0):
                 auth_data["records"][rec_key] = l_rec
                 return l_rec["accessToken"], False
 
         log(f"{COLOR_YELLOW}[OAuth]{COLOR_RESET} AccessToken 即将过期，正在向 MiniMax 账户中心自动换新...")
-        refresh_token = record["refreshToken"]
+        refresh_token = record.get("refreshToken")
+        if not refresh_token:
+            raise ValueError("凭据中缺少有效 refreshToken，无法自动续杯")
+
         payload = urllib.parse.urlencode({
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
@@ -303,34 +390,63 @@ def refresh_token_if_needed(auth_data, alias=None):
         req.add_header("User-Agent", "MiniMaxAgent Mozilla/5.0")
 
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with urllib.request.urlopen(req, timeout=20) as resp:
                 body = json.loads(resp.read().decode("utf-8"))
-                new_access_token = body.get("access_token")
-                new_refresh_token = body.get("refresh_token", refresh_token)
-                expires_in = body.get("expires_in", 3600)
-                new_expires_at = now_ms + int(expires_in * 1000)
-
-                record["accessToken"] = new_access_token
-                record["refreshToken"] = new_refresh_token
-                record["expiresAtMs"] = new_expires_at
-                record["generation"] = record.get("generation", 1) + 1
-                auth_data["records"][rec_key] = record
-
-                if alias:
-                    auth_data["_toolkit_alias"] = alias
-                    auth_data["_updated_at"] = now_ms
-                    atomic_save_json(get_profile_path(alias), auth_data)
-
-                curr_alias = get_current_alias()
-                if curr_alias == alias or (alias is None and os.path.exists(ACTIVE_AUTH_PATH)):
-                    atomic_save_json(ACTIVE_AUTH_PATH, auth_data)
-
-                log(f"{COLOR_GREEN}[OAuth]{COLOR_RESET} 凭据换新成功！有效期至: {format_timestamp(new_expires_at)}")
-                return new_access_token, True
         except urllib.error.HTTPError as e:
             err_msg = e.read().decode("utf-8", errors="ignore")
-            log(f"{COLOR_RED}[OAuth 错误]{COLOR_RESET} 刷新 Token 失败 (HTTP {e.code}): {err_msg}")
-            raise RuntimeError(f"Token refresh failed: {err_msg}")
+            sanitized_err = sanitize_token(err_msg)
+            log(f"{COLOR_RED}[OAuth 错误]{COLOR_RESET} 刷新 Token 失败 (HTTP {e.code}): {sanitized_err}")
+            raise RuntimeError(f"Token refresh failed (HTTP {e.code}): {sanitized_err}")
+        except urllib.error.URLError as e:
+            sanitized_err = sanitize_token(str(e.reason))
+            log(f"{COLOR_RED}[OAuth 网络错误]{COLOR_RESET} 连接失败: {sanitized_err}")
+            raise RuntimeError(f"Token refresh network error: {sanitized_err}")
+
+        new_access_token = body.get("access_token")
+        if not isinstance(new_access_token, str) or not new_access_token.strip():
+            raise RuntimeError("OAuth 响应中未包含有效 access_token 字符串，中止写入以保护凭据完整性")
+
+        new_refresh_token = body.get("refresh_token", refresh_token)
+        try:
+            raw_exp = int(body.get("expires_in", 3600))
+            expires_in_sec = max(60, min(raw_exp, 2592000))
+        except (ValueError, TypeError):
+            expires_in_sec = 3600
+
+        new_expires_at = now_ms + int(expires_in_sec * 1000)
+
+        # 增量原地合并，杜绝盲写
+        record["accessToken"] = new_access_token
+        record["refreshToken"] = new_refresh_token
+        record["expiresAtMs"] = new_expires_at
+        record["generation"] = record.get("generation", 1) + 1
+        auth_data["records"][rec_key] = record
+
+        # 锁内同步写回 Profile 磁盘
+        if alias:
+            p_path = get_profile_path(alias)
+            disk_profile = load_json(p_path) or {"schemaVersion": 1, "records": {}}
+            if "records" not in disk_profile:
+                disk_profile["records"] = {}
+            disk_profile["records"][rec_key] = record
+            disk_profile["_toolkit_alias"] = alias
+            disk_profile["_updated_at"] = now_ms
+            atomic_save_json(p_path, disk_profile)
+
+        # 若刷新的是当前活跃账号，同步更新 active auth.json
+        curr_alias = get_current_alias()
+        if curr_alias == alias or (alias is None and os.path.exists(ACTIVE_AUTH_PATH)):
+            active_disk = load_json(ACTIVE_AUTH_PATH) or {"schemaVersion": 1, "records": {}}
+            if "records" not in active_disk:
+                active_disk["records"] = {}
+            active_disk["records"][rec_key] = record
+            if alias:
+                active_disk["_toolkit_alias"] = alias
+            active_disk["_updated_at"] = now_ms
+            atomic_save_json(ACTIVE_AUTH_PATH, active_disk)
+
+        log(f"{COLOR_GREEN}[OAuth]{COLOR_RESET} 凭据换新成功！有效期至: {format_timestamp(new_expires_at)}")
+        return new_access_token, True
 
 def call_minimax_gateway(path, method="GET", body=None, token=None, device_uuid=None, user_id=None):
     now_ms = int(time.time() * 1000)
@@ -355,11 +471,12 @@ def call_minimax_gateway(path, method="GET", body=None, token=None, device_uuid=
         "cpu_core_num": "12",
         "browser_language": "zh-CN",
         "browser_platform": "MacIntel" if sys.platform == "darwin" else "Win32",
-        "user_id": user_id or "508070720593346564",
         "screen_width": "1280",
         "screen_height": "800",
         "client": "desktop"
     }
+    if user_id and str(user_id) != "(未解析UID)":
+        params["user_id"] = str(user_id)
 
     query_str = urllib.parse.urlencode(params)
     hasSearchParamsPath = f"{path}?{query_str}"
@@ -368,7 +485,7 @@ def call_minimax_gateway(path, method="GET", body=None, token=None, device_uuid=
     body_str_for_sig = ""
     body_str_for_yy = "{}"
     if body is not None:
-        body_bytes = json.dumps(body, separators=(",", ":")).encode("utf-8")
+        body_bytes = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
         body_str_for_sig = body_bytes.decode("utf-8")
         body_str_for_yy = body_str_for_sig
 
@@ -391,8 +508,25 @@ def call_minimax_gateway(path, method="GET", body=None, token=None, device_uuid=
     req.add_header("x-timestamp", str(second))
     req.add_header("x-signature", x_sig)
 
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    max_retries = 2
+    for attempt in range(max_retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                raw_resp = resp.read().decode("utf-8")
+                return json.loads(raw_resp)
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8", errors="ignore")
+            # 遇到 429 或 5xx 服务端临时错误进行指数退避重试
+            if e.code in (429, 500, 502, 503, 504) and attempt < max_retries:
+                time.sleep(1.0 * (attempt + 1))
+                continue
+            sanitized = sanitize_token(err_body)
+            raise RuntimeError(f"MiniMax 网关调用失败 (HTTP {e.code}): {sanitized[:200]}")
+        except urllib.error.URLError as e:
+            if attempt < max_retries:
+                time.sleep(1.0 * (attempt + 1))
+                continue
+            raise RuntimeError(f"MiniMax 网关网络连接失败: {e.reason}")
 
 # -----------------------------------------------------------------------------
 # 命令实现：RFC 8628 设备码授权登录 (`minimax login <alias>`)
@@ -543,69 +677,76 @@ def cmd_login(alias=None):
 # 命令实现：账号切换 (`minimax switch [alias]`) - Sync-before-switch 铁律
 # -----------------------------------------------------------------------------
 def cmd_switch(alias=None):
-    profiles = list_profiles()
-    current_alias = get_current_alias()
+    with SingleFlightFileLock(LOCK_FILE_PATH):
+        profiles = list_profiles()
+        current_alias = get_current_alias()
 
-    if not profiles:
-        print(f"{COLOR_YELLOW}当前尚未录入任何账号。请先运行: minimax login <alias>{COLOR_RESET}")
-        return 1
-
-    if not alias:
-        print(f"\n{COLOR_BOLD}{COLOR_CYAN}=== MiniMax 账号切换控制中心 ==={COLOR_RESET}")
-        for idx, p in enumerate(profiles, 1):
-            is_curr = (p == current_alias)
-            tag = f"{COLOR_GREEN}[当前活跃]{COLOR_RESET}" if is_curr else ""
-            p_data = load_json(get_profile_path(p))
-            _, rec = get_record_from_auth(p_data)
-            meta = extract_account_meta(rec)
-            exp = format_timestamp(meta.get("expiresAtMs"))
-            print(f"  {COLOR_BOLD}{idx}.{COLOR_RESET} {p:<15} {meta.get('userName')} ({meta.get('userId')}) | 到期: {exp} {tag}")
-
-        choice = input(f"\n请选择要切换的账号序号 (1-{len(profiles)}) [q 退出]: ").strip()
-        if choice.lower() in ("q", "quit", "exit", ""):
-            print("已取消切换。")
-            return 0
-        try:
-            sel_idx = int(choice) - 1
-            if 0 <= sel_idx < len(profiles):
-                alias = profiles[sel_idx]
-            else:
-                print(f"{COLOR_RED}无效序号。{COLOR_RESET}")
-                return 1
-        except ValueError:
-            print(f"{COLOR_RED}请输入合法数字序号。{COLOR_RESET}")
+        if not profiles:
+            print(f"{COLOR_YELLOW}当前尚未录入任何账号。请先运行: minimax login <alias>{COLOR_RESET}")
             return 1
 
-    clean_alias = os.path.basename(alias).replace(".json", "")
-    target_path = get_profile_path(clean_alias)
-    if not os.path.exists(target_path):
-        print(f"{COLOR_RED}错误: 未找到账号 [{clean_alias}] 的凭据文件 ({target_path})。{COLOR_RESET}")
-        print(f"可用账号列表: {', '.join(profiles)}")
-        return 1
+        if not alias:
+            print(f"\n{COLOR_BOLD}{COLOR_CYAN}=== MiniMax 账号切换控制中心 ==={COLOR_RESET}")
+            for idx, p in enumerate(profiles, 1):
+                is_curr = (p == current_alias)
+                tag = f"{COLOR_GREEN}[当前活跃]{COLOR_RESET}" if is_curr else ""
+                p_data = load_json(get_profile_path(p))
+                _, rec = get_record_from_auth(p_data)
+                meta = extract_account_meta(rec)
+                exp = format_timestamp(meta.get("expiresAtMs"))
+                print(f"  {COLOR_BOLD}{idx}.{COLOR_RESET} {p:<15} {meta.get('userName')} ({meta.get('userId')}) | 到期: {exp} {tag}")
 
-    sync_active_to_profile()
+            choice = input(f"\n请选择要切换的账号序号 (1-{len(profiles)}) [q 退出]: ").strip()
+            if choice.lower() in ("q", "quit", "exit", ""):
+                print("已取消切换。")
+                return 0
+            try:
+                sel_idx = int(choice) - 1
+                if 0 <= sel_idx < len(profiles):
+                    alias = profiles[sel_idx]
+                else:
+                    print(f"{COLOR_RED}无效序号。{COLOR_RESET}")
+                    return 1
+            except ValueError:
+                print(f"{COLOR_RED}请输入合法数字序号。{COLOR_RESET}")
+                return 1
 
-    target_auth = load_json(target_path)
-    rec_key, rec = get_record_from_auth(target_auth)
-    if not rec:
-        print(f"{COLOR_RED}错误: 账号 [{clean_alias}] 的凭据文件损坏，未包含有效 Token。{COLOR_RESET}")
-        return 1
+        clean_alias = os.path.basename(str(alias)).replace(".json", "")
+        if not ALIAS_PATTERN.match(clean_alias):
+            print(f"{COLOR_RED}错误: 非法的账号别名 [{alias}]，仅允许 1~64 位的英文字母、数字、下划线及减号。{COLOR_RESET}")
+            return 1
 
-    try:
-        refresh_token_if_needed(target_auth, alias=clean_alias)
-    except Exception as e:
-        print(f"{COLOR_YELLOW}警告: 自动刷新目标 Token 出现异常 ({e})，继续尝试激活...{COLOR_RESET}")
+        target_path = get_profile_path(clean_alias)
+        if not os.path.exists(target_path):
+            print(f"{COLOR_RED}错误: 未找到账号 [{clean_alias}] 的凭据文件 ({target_path})。{COLOR_RESET}")
+            print(f"可用账号列表: {', '.join(profiles)}")
+            return 1
 
-    target_auth["_toolkit_alias"] = clean_alias
-    target_auth["_switched_at"] = int(time.time() * 1000)
-    atomic_save_json(ACTIVE_AUTH_PATH, target_auth)
+        # 1. 锁内同步当前活跃凭据至 Profile
+        sync_active_to_profile()
 
-    meta = extract_account_meta(rec)
-    print(f"\n{COLOR_GREEN}✔ 账号切换成功！当前活跃账号: {COLOR_BOLD}[{clean_alias}]{COLOR_RESET}")
-    print(f"  • 用户身份: {meta['userName']} ({meta['userId']})")
-    print(f"  • 凭据代数: Generation {meta.get('generation', 1)}")
-    print(f"  • 活跃路径: {ACTIVE_AUTH_PATH}")
-    return 0
+        # 2. 锁内重读目标 Profile 确保最新
+        target_auth = load_json(target_path)
+        rec_key, rec = get_record_from_auth(target_auth)
+        if not rec:
+            print(f"{COLOR_RED}错误: 账号 [{clean_alias}] 的凭据文件损坏，未包含有效 Token。{COLOR_RESET}")
+            return 1
+
+        try:
+            refresh_token_if_needed(target_auth, alias=clean_alias)
+        except Exception as e:
+            print(f"{COLOR_YELLOW}警告: 自动刷新目标 Token 出现异常 ({e})，继续尝试激活...{COLOR_RESET}")
+
+        target_auth["_toolkit_alias"] = clean_alias
+        target_auth["_switched_at"] = int(time.time() * 1000)
+        atomic_save_json(ACTIVE_AUTH_PATH, target_auth)
+
+        meta = extract_account_meta(target_auth["records"][rec_key])
+        print(f"\n{COLOR_GREEN}✔ 账号切换成功！当前活跃账号: {COLOR_BOLD}[{clean_alias}]{COLOR_RESET}")
+        print(f"  • 用户身份: {meta['userName']} ({meta['userId']})")
+        print(f"  • 凭据代数: Generation {meta.get('generation', 1)}")
+        print(f"  • 活跃路径: {ACTIVE_AUTH_PATH}")
+        return 0
 
 # -----------------------------------------------------------------------------
 # 命令实现：账号清单与状态审计 (`minimax list`, `minimax audit`)
@@ -655,7 +796,10 @@ def cmd_list():
             except Exception:
                 status_tag = f"{COLOR_DIM}探针受限{COLOR_RESET}"
 
-        user_display = f"{meta.get('userName')} ({meta.get('userId')[:8]}..)"
+        raw_uid = str(meta.get("userId") or "未知")
+        uid_short = (raw_uid[:8] + "..") if len(raw_uid) > 8 else raw_uid
+        user_name = str(meta.get("userName") or "MiniMax用户")
+        user_display = f"{user_name} ({uid_short})"
         gen_str = f"Gen {meta.get('generation', 1)}"
         print(f"{name_tag:<22} {user_display:<22} {gen_str:<8} {exp_display:<28} {status_tag}")
 
@@ -817,7 +961,10 @@ def cmd_checkin(target="--all"):
     log(f"  • 此前已打卡:   {already_count} 个")
     log(f"  • 失败/异常:    {fail_count} 个")
 
-    assert (success_count + fail_count) == len(targets), "数学守恒违背: 成功数+失败数 不等于 处理总数"
+    if (success_count + fail_count) != len(targets):
+        log(f"{COLOR_RED}✘ 全局数学守恒硬断言失败: 处理总数 ({len(targets)}) != 成功数 ({success_count}) + 失败数 ({fail_count}){COLOR_RESET}")
+        raise RuntimeError(f"数学守恒违背: 处理总数 ({len(targets)}) != 成功 ({success_count}) + 失败 ({fail_count})")
+
     log(f"{COLOR_GREEN}✔ 全量账号打卡对账完毕，守恒校验 100% 成立。{COLOR_RESET}\n")
     return 0 if fail_count == 0 else 1
 
@@ -881,6 +1028,8 @@ def cmd_cron(action="install"):
         bin_path = os.path.abspath(__file__)
 
     if action in ("install", "setup"):
+        escaped_bin = xml.sax.saxutils.escape(bin_path, {'"': '&quot;', "'": '&apos;'})
+        escaped_log = xml.sax.saxutils.escape(CHECKIN_LOG_PATH, {'"': '&quot;', "'": '&apos;'})
         plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -889,7 +1038,7 @@ def cmd_cron(action="install"):
     <string>com.minimax.dailycheckin</string>
     <key>ProgramArguments</key>
     <array>
-        <string>{bin_path}</string>
+        <string>{escaped_bin}</string>
         <string>checkin</string>
         <string>--all</string>
     </array>
@@ -901,9 +1050,9 @@ def cmd_cron(action="install"):
         <integer>5</integer>
     </dict>
     <key>StandardOutPath</key>
-    <string>{CHECKIN_LOG_PATH}</string>
+    <string>{escaped_log}</string>
     <key>StandardErrorPath</key>
-    <string>{CHECKIN_LOG_PATH}</string>
+    <string>{escaped_log}</string>
     <key>RunAtLoad</key>
     <false/>
 </dict>
@@ -953,6 +1102,17 @@ https://github.com/FlapPearLabs/minimax-toolkit
 """)
 
 def main():
+    # 自动识别以别名调用的符号链接/垫片 (如 mmx-checkin, minimax-login 等)
+    prog_name = os.path.basename(sys.argv[0]).lower()
+    for prefix in ("mmx-", "minimax-"):
+        if prog_name.startswith(prefix):
+            subcmd = prog_name[len(prefix):]
+            if subcmd.endswith(".cmd"):
+                subcmd = subcmd[:-4]
+            if subcmd and (len(sys.argv) < 2 or sys.argv[1].lower() != subcmd):
+                sys.argv.insert(1, subcmd)
+            break
+
     if len(sys.argv) < 2:
         print_help()
         sys.exit(0)

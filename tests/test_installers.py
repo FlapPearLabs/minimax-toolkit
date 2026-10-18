@@ -83,5 +83,36 @@ class TestInstallersLifecycle(unittest.TestCase):
         self.assertTrue(os.path.exists(main_script))
         self.assertEqual(os.path.getsize(main_script), file_size_before)
 
+    def test_uninstall_with_purge(self):
+        """测试 uninstall.py --purge 彻底清理账号凭据、日志与运行时状态"""
+        # 1. 运行安装器
+        subprocess.run([sys.executable, INSTALLER_PATH], capture_output=True, text=True, encoding="utf-8", errors="replace", env=self.env)
+
+        # 2. 模拟创建 profile 和 log
+        mmx_dir = os.path.join(self.temp_home, ".minimax")
+        profiles_dir = os.path.join(mmx_dir, "auth_profiles")
+        logs_dir = os.path.join(mmx_dir, "logs")
+        os.makedirs(profiles_dir, exist_ok=True)
+        os.makedirs(logs_dir, exist_ok=True)
+        dummy_profile = os.path.join(profiles_dir, "test.json")
+        with open(dummy_profile, "w", encoding="utf-8") as f:
+            f.write('{"test": true}')
+        dummy_log = os.path.join(logs_dir, "checkin.log")
+        with open(dummy_log, "w", encoding="utf-8") as f:
+            f.write('sample log')
+
+        self.assertTrue(os.path.exists(dummy_profile))
+        self.assertTrue(os.path.exists(dummy_log))
+
+        # 3. 执行 purge 卸载
+        unres = subprocess.run([sys.executable, UNINSTALLER_PATH, "--purge"], capture_output=True, text=True, encoding="utf-8", errors="replace", env=self.env)
+        self.assertEqual(unres.returncode, 0)
+        self.assertIn("彻底清理", unres.stdout)
+
+        # 4. 物理断言数据目录已清理
+        self.assertFalse(os.path.exists(profiles_dir))
+        self.assertFalse(os.path.exists(dummy_profile))
+        self.assertFalse(os.path.exists(dummy_log))
+
 if __name__ == "__main__":
     unittest.main()

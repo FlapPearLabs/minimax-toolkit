@@ -55,5 +55,22 @@ class TestMinimaxCLI(unittest.TestCase):
         self.assertEqual(res.returncode, 0)
         self.assertIn("暂无任何录入账号", res.stdout)
 
+    def test_symlink_dispatch(self):
+        """测试通过符号链接/垫片别名 (如 mmx-doctor, mmx-help) 调用的自动命令调度"""
+        temp_link_dir = tempfile.mkdtemp()
+        try:
+            if sys.platform != "win32":
+                link_path = os.path.join(temp_link_dir, "mmx-doctor")
+                os.symlink(CLI_PATH, link_path)
+                res = subprocess.run([link_path], capture_output=True, text=True, encoding="utf-8", errors="replace", env=self.env)
+                self.assertEqual(res.returncode, 0)
+                self.assertIn("MiniMax Toolkit 运行时自检诊断报告", res.stdout)
+            else:
+                res = subprocess.run([sys.executable, CLI_PATH, "doctor"], capture_output=True, text=True, encoding="utf-8", errors="replace", env=self.env)
+                self.assertEqual(res.returncode, 0)
+                self.assertIn("MiniMax Toolkit 运行时自检诊断报告", res.stdout)
+        finally:
+            shutil.rmtree(temp_link_dir, ignore_errors=True)
+
 if __name__ == "__main__":
     unittest.main()
