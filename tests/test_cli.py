@@ -68,6 +68,35 @@ class TestMinimaxCLI(unittest.TestCase):
         self.assertIn("checks", payload)
         self.assertIsInstance(payload["healthy"], bool)
 
+    def test_list_prefers_active_generation_over_stale_profile(self):
+        """活跃凭据被刷新过时，list 必须先回写 profile，不能显示旧代数"""
+        import time as _t
+        mmx_dir = os.path.join(self.temp_home, ".minimax")
+        profiles_dir = os.path.join(mmx_dir, "auth_profiles")
+        active_dir = os.path.join(mmx_dir, "auth", "prod", "cn", "mcode-public")
+        os.makedirs(profiles_dir, exist_ok=True)
+        os.makedirs(active_dir, exist_ok=True)
+        key = "com.minimax.mcode.oauth.prod.cn\u0000rec"
+        now = int(_t.time() * 1000)
+
+        def record(gen):
+            return {"schemaVersion": 1, "_toolkit_alias": "main", "records": {key: {
+                "accessToken": f"mmoat_fake_{gen}", "refreshToken": f"mmort_fake_{gen}",
+                "generation": gen, "expiresAtMs": now + 3600_000}}}
+
+        with open(os.path.join(profiles_dir, "main.json"), "w", encoding="utf-8") as f:
+            json.dump(record(4), f)
+        with open(os.path.join(active_dir, "auth.json"), "w", encoding="utf-8") as f:
+            json.dump(record(9), f)
+
+        res = self.run_cli("list", "--offline", "--json")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        payload = json.loads(res.stdout)
+        self.assertEqual(payload["accounts"][0]["generation"], 9)
+
+        with open(os.path.join(profiles_dir, "main.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["records"][key]["generation"], 9)
+
     def test_doctor_fails_when_last_run_failed(self):
         """【新鲜度控制面】最近一次执行失败必须 fail，不能因为时间新就报 ok"""
         mmx_dir = os.path.join(self.temp_home, ".minimax")

@@ -1045,6 +1045,12 @@ def profile_status_snapshot(p, offline=False):
 def cmd_list(args):
     offline = has_flag(args, "--offline", "--no-network")
     as_json = has_flag(args, "--json")
+    # 活跃凭据可能被官方客户端/运行期刷新过，先做一次 best-effort 回写，
+    # 保证 list 显示的代数与到期时间不会落后于 auth.json。
+    try:
+        sync_active_to_profile()
+    except Exception:
+        pass
     profiles = list_profiles()
     current_alias = get_current_alias()
 
@@ -1375,6 +1381,22 @@ def cmd_checkin(args):
 # -----------------------------------------------------------------------------
 # 定时任务纳管 (macOS launchd / Linux systemd user / Windows Task Scheduler)
 # -----------------------------------------------------------------------------
+def scheduler_path():
+    """调度器需要的最小可用 PATH：解释器目录 + ~/.local/bin + 当前 PATH（保序去重）"""
+    raw = [os.path.dirname(sys.executable), os.path.join(HOME, ".local", "bin"),
+           "/usr/local/bin", "/usr/bin", "/bin"]
+    raw += (os.environ.get("PATH") or "").split(os.pathsep)
+    seen = set()
+    ordered = []
+    for part in raw:
+        part = part.strip()
+        if not part or part in seen:
+            continue
+        seen.add(part)
+        ordered.append(part)
+    return os.pathsep.join(ordered)
+
+
 def scheduler_cli_command():
     """返回调度器应当执行的命令前缀（优先使用已安装的入口）"""
     if sys.platform == "win32":
@@ -1383,12 +1405,11 @@ def scheduler_cli_command():
             return [installed]
         return [sys.executable, os.path.abspath(__file__)]
     installed = os.path.join(HOME, ".local", "bin", "minimax")
+    # 优先使用安装入口（#!/usr/bin/env python3）：不把 Homebrew/pyenv 的
+    # 具体版本路径钉死在 plist/unit 里，避免解释器升级后被删除导致静默 127。
+    # 解释器目录通过调度器的 PATH 环境变量补在前面。
     if os.path.exists(installed):
-        try:
-            if not os.path.samefile(installed, os.path.abspath(__file__)):
-                return [installed]
-        except Exception:
-            return [installed]
+        return [installed]
     return [sys.executable, os.path.abspath(__file__)]
 
 
@@ -1504,15 +1525,19 @@ def _install_launchd(mode):
             "        <integer>5</integer>\n"
             "    </dict>\n"
         )
-    env_xml = ""
+    sched_path = scheduler_path()
+    env_xml = (
+        "    <key>EnvironmentVariables</key>\n"
+        "    <dict>\n"
+        "        <key>PATH</key>\n"
+        f"        <string>{xml_escape(sched_path)}</string>\n"
+    )
     if os.environ.get("MINIMAX_HOME"):
-        env_xml = (
-            "    <key>EnvironmentVariables</key>\n"
-            "    <dict>\n"
+        env_xml += (
             "        <key>MINIMAX_HOME</key>\n"
             f"        <string>{xml_escape(os.environ['MINIMAX_HOME'])}</string>\n"
-            "    </dict>\n"
         )
+    env_xml += "    </dict>\n"
     plist_content = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
@@ -1558,8 +1583,7 @@ def _install_systemd(mode):
 
     exec_start = " ".join(f'"{c}"' if " " in c else c for c in cli) + " checkin --all"
     env_lines = []
-    unit_path = (os.path.dirname(sys.executable) + ":" + os.path.join(HOME, ".local", "bin")
-                 + ":" + os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"))
+    unit_path = scheduler_path()
     env_lines.append(f'Environment="PATH={unit_path}"')
     if os.environ.get("MINIMAX_HOME"):
         env_lines.append(f'Environment="MINIMAX_HOME={os.environ["MINIMAX_HOME"]}"')
@@ -1724,7 +1748,11 @@ def cmd_cron(args):
 
         state = read_state()
         last = state.get("last_run_at")
-        print(f"  • 最近执行: {format_timestamp(last) if last else '暂无记录'}")
+        last_result = state.get("last_run_result")
+        last_text = format_timestamp(last) if last else "暂无记录"
+        if last and last_result:
+            last_text += f" (结果={last_result})"
+        print(f"  • 最近执行: {last_text}")
         if info["installed"] and not info["active"]:
             print(f"\n  {COLOR_RED}✘ 服务已安装但未激活，请重新执行: minimax cron install{COLOR_RESET}")
             return EXIT_ERROR
