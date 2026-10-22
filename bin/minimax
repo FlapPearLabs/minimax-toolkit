@@ -1813,10 +1813,15 @@ def cmd_doctor(args):
     else:
         age_h = (now_ms - last_run) / 3600000.0
         success_age_h = (now_ms - last_success) / 3600000.0 if last_success else None
-        detail = f"最近执行 {format_timestamp(last_run)} ({age_h:.1f}h 前), 结果={state.get('last_run_result')}"
+        result = state.get("last_run_result")
+        detail = f"最近执行 {format_timestamp(last_run)} ({age_h:.1f}h 前), 结果={result}"
         if last_success:
             detail += f", 最近成功 {success_age_h:.1f}h 前"
-        if success_age_h is not None and success_age_h > 36:
+        if result in ("failed", "invariant_violation", "no_accounts"):
+            add("last_checkin", "fail", detail + " | 最近一次执行失败，请运行 minimax audit 排查")
+        elif result == "partial":
+            add("last_checkin", "warn", detail + " | 部分账号失败")
+        elif success_age_h is not None and success_age_h > 36:
             add("last_checkin", "fail", detail + " | 超过 36 小时未成功打卡")
         elif age_h > 26:
             add("last_checkin", "warn", detail + " | 超过 26 小时未执行，检查调度器")

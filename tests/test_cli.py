@@ -68,6 +68,25 @@ class TestMinimaxCLI(unittest.TestCase):
         self.assertIn("checks", payload)
         self.assertIsInstance(payload["healthy"], bool)
 
+    def test_doctor_fails_when_last_run_failed(self):
+        """【新鲜度控制面】最近一次执行失败必须 fail，不能因为时间新就报 ok"""
+        mmx_dir = os.path.join(self.temp_home, ".minimax")
+        os.makedirs(os.path.join(mmx_dir, "auth_profiles"), exist_ok=True)
+        import time as _t
+        state = {"last_run_at": int(_t.time() * 1000) - 60_000,
+                 "last_run_result": "failed",
+                 "last_run_summary": {"total": 2, "failed": 2}}
+        with open(os.path.join(mmx_dir, "state.json"), "w", encoding="utf-8") as f:
+            json.dump(state, f)
+
+        res = self.run_cli("doctor", "--offline", "--json")
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        doc = json.loads(res.stdout)
+        self.assertFalse(doc["healthy"])
+        check = next(c for c in doc["checks"] if c["name"] == "last_checkin")
+        self.assertEqual(check["status"], "fail")
+        self.assertIn("最近一次执行失败", check["detail"])
+
     def test_list_empty_environment(self):
         res = self.run_cli("list")
         self.assertEqual(res.returncode, 0)
