@@ -2,9 +2,10 @@ name: CI & Zero-Leak Audit
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, 'fix/**', 'feat/**' ]
   pull_request:
     branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   security-audit:
@@ -19,33 +20,40 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Scan for Hardcoded Local Paths & Secrets
+      - name: Scan for Hardcoded Local Paths, Secrets and Real Tokens
         run: |
-          echo "Running Zero-Leak Sanitization Check..."
           python3 -c "
           import os, re, sys
-          pattern = re.compile(r'/Users/(?!runner\b)[a-zA-Z0-9_\-]+')
-          win_pattern = re.compile(r'C:\\\\Users\\\\(?!runneradmin\b)[a-zA-Z0-9_\-]+', re.IGNORECASE)
+          patterns = [
+              (re.compile(r'/Users/(?!runner\b)[a-zA-Z0-9_\-]+'), 'macOS user home path'),
+              (re.compile(r'C:\\\\Users\\\\(?!runneradmin\b)[a-zA-Z0-9_\-]+', re.I), 'Windows user home path'),
+              (re.compile(r'/home/(?!runner\b)[a-zA-Z0-9_\-]+'), 'Linux user home path'),
+              (re.compile(r'mmo[ar]t_[A-Za-z0-9_\-]{24,}'), 'real MiniMax OAuth token'),
+              (re.compile(r'eyJ[A-Za-z0-9_\-]{15,}\.[A-Za-z0-9_\-]{15,}\.[A-Za-z0-9_\-]{10,}'), 'JWT credential'),
+              (re.compile(r'(?<!\d)1[3-9]\d{9}(?!\d)'), 'mainland China phone number'),
+          ]
+          skip_dirs = {'.git', '__pycache__', '.pytest_cache'}
           found = False
           for root, dirs, files in os.walk('.'):
-              if '.git' in dirs: dirs.remove('.git')
+              dirs[:] = [d for d in dirs if d not in skip_dirs]
               for f in files:
                   p = os.path.join(root, f)
                   try:
                       with open(p, 'r', encoding='utf-8', errors='ignore') as fp:
                           for idx, line in enumerate(fp, 1):
-                              if pattern.search(line) or win_pattern.search(line):
-                                  print(f'::error file={p},line={idx}::Hardcoded user home path detected: {line.strip()}')
-                                  found = True
+                              for pattern, label in patterns:
+                                  if pattern.search(line):
+                                      print(f'::error file={p},line={idx}::{label}: {line.strip()[:120]}')
+                                      found = True
                   except Exception:
                       pass
           if found:
               sys.exit(1)
-          print('✔ Zero-Leak Path Audit passed.')
+          print('Zero-Leak audit passed: no user paths, tokens, or credentials.')
           "
 
   test:
-    name: Test on ${{ matrix.os }} (Python ${{ matrix.python-version }})
+    name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
     needs: security-audit
     runs-on: ${{ matrix.os }}
     env:
@@ -55,7 +63,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        python-version: ["3.10", "3.11", "3.12"]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
 
     steps:
       - name: Checkout Code
@@ -66,6 +74,29 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Verify Python Syntax & Bytecode Compilation
+        run: |
+          python -m py_compile bin/minimax
+          python -m py_compile install.py
+          python -m py_compile uninstall.py
+
       - name: Run Test Suite
         run: |
           python -m unittest discover -s tests -v
+
+      - name: Native Shell Installer Smoke Test (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: |
+          bash ./install.sh --checkin-mode=none
+          "$HOME/.local/bin/minimax" --version
+          "$HOME/.local/bin/mmx" list --offline
+          bash ./uninstall.sh
+
+      - name: Native PowerShell Installer Smoke Test (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          powershell -ExecutionPolicy Bypass -File .\install.ps1 --checkin-mode=none
+          & "$env:USERPROFILE\.minimax\bin\minimax.cmd" --version
+          & "$env:USERPROFILE\.minimax\bin\mmx.cmd" list --offline
+          powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
