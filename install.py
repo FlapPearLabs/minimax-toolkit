@@ -21,9 +21,10 @@ if sys.platform == "win32":
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 HOME = os.path.expanduser("~")
-MINIMAX_DIR = os.path.join(HOME, ".minimax")
+MINIMAX_DIR = os.environ.get("MINIMAX_HOME") or os.path.join(HOME, ".minimax")
 AUTH_PROFILES_DIR = os.path.join(MINIMAX_DIR, "auth_profiles")
 LOGS_DIR = os.path.join(MINIMAX_DIR, "logs")
+MIN_PYTHON = (3, 8)
 
 IS_TTY = sys.stdout.isatty() and sys.stderr.isatty()
 COLOR_GREEN = "\033[92m" if IS_TTY else ""
@@ -34,16 +35,32 @@ COLOR_DIM = "\033[2m" if IS_TTY else ""
 COLOR_BOLD = "\033[1m" if IS_TTY else ""
 COLOR_RESET = "\033[0m" if IS_TTY else ""
 
+ALIASES = [
+    "mmx", "minimax-help", "mmx-help",
+    "minimax-login", "mmx-login",
+    "minimax-switch", "mmx-switch",
+    "minimax-list", "mmx-list",
+    "minimax-status", "mmx-status",
+    "minimax-checkin", "mmx-checkin",
+    "minimax-audit", "mmx-audit",
+    "minimax-doctor", "mmx-doctor",
+    "minimax-cron", "mmx-cron",
+]
+SUBCOMMANDS = ["login", "switch", "list", "status", "checkin", "audit", "doctor", "cron", "help"]
+
+
 def print_banner():
     print(f"\n{COLOR_BOLD}{COLOR_CYAN}========================================================{COLOR_RESET}")
     print(f"{COLOR_BOLD}{COLOR_CYAN}    MiniMax Toolkit 全平台通用安装程序 ({sys.platform}){COLOR_RESET}")
     print(f"{COLOR_BOLD}{COLOR_CYAN}    Developed by FlapPearLabs (Zero-Dependency){COLOR_RESET}")
     print(f"{COLOR_BOLD}{COLOR_CYAN}========================================================{COLOR_RESET}\n")
 
+
 def setup_dirs():
     os.makedirs(AUTH_PROFILES_DIR, exist_ok=True)
     os.makedirs(LOGS_DIR, exist_ok=True)
     print(f"{COLOR_GREEN}✔ 基础配置目录已就绪: {MINIMAX_DIR}{COLOR_RESET}")
+
 
 def is_same_path(p1, p2):
     """【铁律防御】跨平台物理判断源与目标是否指向同一文件，杜绝自噬"""
@@ -51,6 +68,27 @@ def is_same_path(p1, p2):
         return os.path.samefile(p1, p2)
     except Exception:
         return os.path.abspath(p1) == os.path.abspath(p2)
+
+
+def _windows_cmd_wrapper():
+    # 优先 py -3，其次 python3，最后 python（避开 Windows Store 假别名）
+    return (
+        "@echo off\r\n"
+        "setlocal\r\n"
+        "where py >nul 2>nul\r\n"
+        "if %ERRORLEVEL% equ 0 (\r\n"
+        "    py -3 \"%~dp0minimax\" %*\r\n"
+        "    exit /b %ERRORLEVEL%\r\n"
+        ")\r\n"
+        "where python3 >nul 2>nul\r\n"
+        "if %ERRORLEVEL% equ 0 (\r\n"
+        "    python3 \"%~dp0minimax\" %*\r\n"
+        "    exit /b %ERRORLEVEL%\r\n"
+        ")\r\n"
+        "python \"%~dp0minimax\" %*\r\n"
+        "exit /b %ERRORLEVEL%\r\n"
+    )
+
 
 def install_cli():
     src_bin = os.path.join(SCRIPT_DIR, "bin", "minimax")
@@ -67,31 +105,16 @@ def install_cli():
         if not is_same_path(src_bin, dest_bin):
             shutil.copy2(src_bin, dest_bin)
 
-        # 写入 Windows CMD 垫片 (优先使用 py -3 / python3，避免 Windows Store 假别名)
-        cmd_wrapper = (
-            "@echo off\r\n"
-            "setlocal\r\n"
-            "where py >nul 2>nul\r\n"
-            "if %ERRORLEVEL% equ 0 (\r\n"
-            "    py -3 \"%~dp0minimax\" %*\r\n"
-            ") else (\r\n"
-            "    where python3 >nul 2>nul\r\n"
-            "    if %ERRORLEVEL% equ 0 (\r\n"
-            "        python3 \"%~dp0minimax\" %*\r\n"
-            "    ) else (\r\n"
-            "        python \"%~dp0minimax\" %*\r\n"
-            "    )\r\n"
-            ")\r\n"
-        )
+        wrapper = _windows_cmd_wrapper()
         for name in ["minimax.cmd", "mmx.cmd"]:
-            with open(os.path.join(bin_dir, name), "w", encoding="ascii") as f:
-                f.write(cmd_wrapper)
+            with open(os.path.join(bin_dir, name), "w", encoding="ascii", newline="") as f:
+                f.write(wrapper)
 
-        for subcmd in ["login", "switch", "list", "status", "checkin", "audit", "doctor", "cron", "help"]:
-            wrapper = f"@echo off\r\ncall \"%~dp0minimax.cmd\" {subcmd} %*\r\n"
+        for subcmd in SUBCOMMANDS:
+            body = f"@echo off\r\ncall \"%~dp0minimax.cmd\" {subcmd} %*\r\nexit /b %ERRORLEVEL%\r\n"
             for prefix in [f"mmx-{subcmd}.cmd", f"minimax-{subcmd}.cmd"]:
-                with open(os.path.join(bin_dir, prefix), "w", encoding="ascii") as f:
-                    f.write(wrapper)
+                with open(os.path.join(bin_dir, prefix), "w", encoding="ascii", newline="") as f:
+                    f.write(body)
 
         # 尝试配置 Windows PATH (精确分项比对，杜绝子串误判)
         try:
@@ -112,75 +135,104 @@ def install_cli():
 
         print(f"{COLOR_GREEN}✔ CLI 主程序及 Windows 命令垫片已安装至: {bin_dir}{COLOR_RESET}")
         return dest_bin, bin_dir
-    else:
-        bin_dir = os.path.join(HOME, ".local", "bin")
-        os.makedirs(bin_dir, exist_ok=True)
-        dest_bin = os.path.join(bin_dir, "minimax")
 
-        # 原地自噬防御
-        if not is_same_path(src_bin, dest_bin):
-            shutil.copy2(src_bin, dest_bin)
-        os.chmod(dest_bin, 0o755)
+    bin_dir = os.path.join(HOME, ".local", "bin")
+    os.makedirs(bin_dir, exist_ok=True)
+    dest_bin = os.path.join(bin_dir, "minimax")
 
-        # 创建快捷别名软链接
-        for alias in [
-            "mmx", "minimax-help", "mmx-help",
-            "minimax-login", "mmx-login",
-            "minimax-switch", "mmx-switch",
-            "minimax-list", "mmx-list",
-            "minimax-status", "mmx-status",
-            "minimax-checkin", "mmx-checkin",
-            "minimax-audit", "mmx-audit",
-            "minimax-doctor", "mmx-doctor",
-            "minimax-cron", "mmx-cron"
-        ]:
-            link_path = os.path.join(bin_dir, alias)
-            if not is_same_path(link_path, dest_bin):
-                if os.path.islink(link_path) or os.path.exists(link_path):
-                    try:
-                        os.remove(link_path)
-                    except Exception:
-                        pass
-                try:
-                    os.symlink("minimax", link_path)
-                except Exception:
-                    pass
+    # 原地自噬防御
+    if not is_same_path(src_bin, dest_bin):
+        shutil.copy2(src_bin, dest_bin)
+    os.chmod(dest_bin, 0o755)
 
-        print(f"{COLOR_GREEN}✔ CLI 主程序及快捷软链已安装至: {bin_dir}{COLOR_RESET}")
-        return dest_bin, bin_dir
+    for alias in ALIASES:
+        link_path = os.path.join(bin_dir, alias)
+        if is_same_path(link_path, dest_bin):
+            continue
+        if os.path.islink(link_path) or os.path.exists(link_path):
+            try:
+                os.remove(link_path)
+            except Exception:
+                pass
+        try:
+            os.symlink("minimax", link_path)
+        except Exception:
+            pass
 
-def install_services_if_requested(dest_bin):
+    print(f"{COLOR_GREEN}✔ CLI 主程序及快捷软链已安装至: {bin_dir}{COLOR_RESET}")
+    return dest_bin, bin_dir
+
+
+def verify_cli(dest_bin):
+    """安装后真实性验证：实际执行一次 --version，杜绝「装上但跑不起来」"""
+    res = subprocess.run([sys.executable, dest_bin, "--version"],
+                         capture_output=True, text=True, errors="replace")
+    if res.returncode != 0:
+        print(f"{COLOR_RED}✘ 安装后自检失败: {(res.stderr or res.stdout).strip()}{COLOR_RESET}")
+        return False
+    print(f"{COLOR_GREEN}✔ 安装后自检通过: {res.stdout.strip()}{COLOR_RESET}")
+    return True
+
+
+def resolve_checkin_mode(argv):
+    for idx, arg in enumerate(argv):
+        if arg.startswith("--checkin-mode="):
+            return arg.split("=", 1)[1].strip().lower()
+        if arg == "--checkin-mode" and idx + 1 < len(argv):
+            return argv[idx + 1].strip().lower()
+    if "--with-services" in argv:
+        return "calendar"
+    return "none"
+
+
+def install_services(dest_bin, mode):
     """【铁律防御】后台服务必须显式 Opt-in，严禁静默注册常驻任务"""
-    with_services = "--with-services" in sys.argv
-    if not with_services:
-        print(f"{COLOR_YELLOW}提示: 未指定 --with-services，已跳过定时服务自动注册。{COLOR_RESET}")
-        print(f"{COLOR_DIM}若需配置每日 09:05 自动签到，随时运行: minimax cron install 即可。{COLOR_RESET}")
-        return
+    if mode == "none":
+        print(f"{COLOR_YELLOW}提示: 未指定 --checkin-mode，已跳过定时服务自动注册。{COLOR_RESET}")
+        print(f"{COLOR_DIM}若需配置自动签到，随时运行: minimax cron install [--mode calendar|boot] 即可。{COLOR_RESET}")
+        return True
+    if mode not in ("calendar", "boot"):
+        print(f"{COLOR_RED}错误: --checkin-mode 仅支持 calendar / boot / none，收到: {mode}{COLOR_RESET}")
+        return False
 
-    if sys.platform == "darwin":
-        plist_src = os.path.join(SCRIPT_DIR, "launchd", "com.minimax.dailycheckin.plist")
-        if os.path.exists(plist_src):
-            import xml.sax.saxutils
-            plist_dest = os.path.join(HOME, "Library", "LaunchAgents", "com.minimax.dailycheckin.plist")
-            os.makedirs(os.path.dirname(plist_dest), exist_ok=True)
-            with open(plist_src, "r", encoding="utf-8") as f:
-                content = f.read()
-            escaped_dest = xml.sax.saxutils.escape(dest_bin, {'"': '&quot;', "'": '&apos;'})
-            escaped_log = xml.sax.saxutils.escape(os.path.join(LOGS_DIR, "checkin.log"), {'"': '&quot;', "'": '&apos;'})
-            content = content.replace("__CLI_PATH__", escaped_dest).replace("__LOG_PATH__", escaped_log)
-            with open(plist_dest, "w", encoding="utf-8") as f:
-                f.write(content)
-            subprocess.run(["launchctl", "unload", plist_dest], capture_output=True)
-            subprocess.run(["launchctl", "load", plist_dest], capture_output=True)
-            print(f"{COLOR_GREEN}✔ macOS LaunchAgent 定时打卡服务已成功加载！{COLOR_RESET}")
-    else:
-        print(f"{COLOR_YELLOW}Linux / Windows 定时服务请参考 docs/ 使用对应配置。{COLOR_RESET}")
+    # 单一真源：调度逻辑全部收敛在 CLI 的 cron 子命令里
+    res = subprocess.run([sys.executable, dest_bin, "cron", "install", "--mode", mode],
+                         capture_output=True, text=True, errors="replace")
+    output = (res.stdout or "") + (res.stderr or "")
+    print(output.rstrip())
+    return res.returncode == 0
+
+
+def check_path_hint(bin_dir):
+    if sys.platform == "win32":
+        return
+    path_parts = os.environ.get("PATH", "").split(os.pathsep)
+    if os.path.abspath(bin_dir) in [os.path.abspath(p) for p in path_parts if p]:
+        return
+    print(f"{COLOR_YELLOW}△ {bin_dir} 不在当前 PATH 中，请将下面一行加入 shell 配置后重开终端:{COLOR_RESET}")
+    print(f'  export PATH="{bin_dir}:$PATH"')
+
 
 def main():
     print_banner()
+
+    if sys.version_info[:2] < MIN_PYTHON:
+        print(f"{COLOR_RED}错误: 需要 Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]}+，当前为 "
+              f"{sys.version.split()[0]} ({sys.executable}){COLOR_RESET}")
+        sys.exit(1)
+
+    mode = resolve_checkin_mode(sys.argv[1:])
+
     setup_dirs()
     dest_bin, bin_dir = install_cli()
-    install_services_if_requested(dest_bin)
+
+    if not verify_cli(dest_bin):
+        sys.exit(1)
+
+    if not install_services(dest_bin, mode):
+        sys.exit(1)
+
+    check_path_hint(bin_dir)
 
     print(f"\n{COLOR_BOLD}{COLOR_GREEN}========================================================{COLOR_RESET}")
     print(f"{COLOR_BOLD}{COLOR_GREEN}   🎉 MiniMax Toolkit 安装部署全部完成！{COLOR_RESET}")
@@ -191,6 +243,7 @@ def main():
     print(f"  • {COLOR_BOLD}minimax list{COLOR_RESET}           - 查看所有已纳管账号与签到状态")
     print(f"  • {COLOR_BOLD}minimax checkin --all{COLOR_RESET}  - 全量账号批量自动打卡")
     print(f"  • {COLOR_BOLD}minimax doctor{COLOR_RESET}         - 运行时环境诊断\n")
+
 
 if __name__ == "__main__":
     main()

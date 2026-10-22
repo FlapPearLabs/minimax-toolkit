@@ -14,6 +14,8 @@ import json
 import time
 import re
 import hashlib
+import shutil
+import threading
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -21,36 +23,47 @@ import secrets
 import base64
 import subprocess
 import webbrowser
-import xml.sax.saxutils
 from datetime import datetime, timezone, timedelta
 
 # -----------------------------------------------------------------------------
 # 常量与环境路径 (统一跨平台无偏解析，严禁绝对路径硬编码)
 # -----------------------------------------------------------------------------
-VERSION = "0.1.0"
+VERSION = "0.2.0"
+MIN_PYTHON = (3, 8)
+
 HOME = os.path.expanduser("~")
-MINIMAX_DIR = os.path.join(HOME, ".minimax")
+# MINIMAX_HOME 允许测试与多实例部署指向沙盒，生产默认 ~/.minimax
+MINIMAX_DIR = os.environ.get("MINIMAX_HOME") or os.path.join(HOME, ".minimax")
 AUTH_PROFILES_DIR = os.path.join(MINIMAX_DIR, "auth_profiles")
 ACTIVE_AUTH_DIR = os.path.join(MINIMAX_DIR, "auth", "prod", "cn", "mcode-public")
 ACTIVE_AUTH_PATH = os.path.join(ACTIVE_AUTH_DIR, "auth.json")
 LOCK_FILE_PATH = os.path.join(MINIMAX_DIR, "auth", "token_refresh.lock")
 LOGS_DIR = os.path.join(MINIMAX_DIR, "logs")
 CHECKIN_LOG_PATH = os.path.join(LOGS_DIR, "checkin.log")
+STATE_PATH = os.path.join(MINIMAX_DIR, "state.json")
 
 # 安全校验与敏感词脱敏正则 (Zero-Leak)
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 ALIAS_PATTERN = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
 REDACT_PATTERN = re.compile(r"(mmoat_[A-Za-z0-9_\-]+|mmort_[A-Za-z0-9_\-]+|eyJ[A-Za-z0-9_\-]{15,}\.[A-Za-z0-9_\-]{15,}\.[A-Za-z0-9_\-]+)")
 
-# OAuth 与网关端点
-TOKEN_ENDPOINT = "https://account.minimax.cn/oauth2/token"
-DEVICE_CODE_ENDPOINT = "https://account.minimax.cn/oauth2/device/code"
+# OAuth 与网关端点 (可用环境变量指向代理或本地 mock 网关)
+ACCOUNT_BASE = (os.environ.get("MINIMAX_ACCOUNT_BASE") or "https://account.minimax.cn").rstrip("/")
+GATEWAY_BASE = (os.environ.get("MINIMAX_GATEWAY_BASE") or "https://agent.minimax.cn").rstrip("/")
+TOKEN_ENDPOINT = f"{ACCOUNT_BASE}/oauth2/token"
+DEVICE_CODE_ENDPOINT = f"{ACCOUNT_BASE}/oauth2/device/code"
 CLIENT_ID = "mcode-public"
 SCOPE = "agent.default"
 AUDIENCE = "agent-backend"
 
 SIGNATURE_SALT = "I*7Cf%WZ#S&%1RlZJ&C2"
 YY_SUFFIX = "ooui"
-GATEWAY_BASE = "https://agent.minimax.cn"
+
+# 定时任务标识
+LAUNCHD_LABEL = "com.minimax.dailycheckin"
+SYSTEMD_UNIT = "minimax-checkin"
+WINDOWS_TASK_CALENDAR = "MiniMaxDailyCheckin"
+WINDOWS_TASK_BOOT = "MiniMaxBootCheckin"
 
 # 时区常量 (强制 Timezone-Aware，杜绝跨平台/CI 8小时时区漂移)
 TZ_SHANGHAI = timezone(timedelta(hours=8))
@@ -77,31 +90,61 @@ COLOR_BOLD = "\033[1m" if IS_TTY else ""
 COLOR_DIM = "\033[2m" if IS_TTY else ""
 COLOR_RESET = "\033[0m" if IS_TTY else ""
 
+EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_USAGE = 2
+EXIT_INTERNAL = 3
+EXIT_INVARIANT = 4
+
+
 # -----------------------------------------------------------------------------
 # 跨平台单飞文件锁 (Single-Flight Lock) - 防多进程并发刷新导致 Token 吊销
 # -----------------------------------------------------------------------------
+# 说明: flock/msvcrt 均以「打开的文件描述」为单位加锁，同一进程内二次 open()
+# 再加锁同样会阻塞。因此这里维护「同线程可重入」状态：
+#   - 同一线程嵌套进入 -> 深度计数，不重复加锁（修复 switch 自锁死）
+#   - 不同线程 / 不同进程 -> 仍然严格走操作系统级排他锁
+_LOCK_STATE = {}
+_LOCK_STATE_GUARD = threading.Lock()
+
+
 class SingleFlightFileLock:
     """跨平台文件排他锁，防止多进程同时使用相同 Refresh Token 触发服务重放风控"""
+
     def __init__(self, lock_path, timeout=30, timeout_sec=None):
         self.lock_path = lock_path
         self.timeout = timeout if timeout_sec is None else timeout_sec
         self.fd = None
         self._locked = False
+        self._reentrant = False
+        self._path_key = None
+        self._tid = None
 
     def __enter__(self):
-        os.makedirs(os.path.dirname(os.path.abspath(self.lock_path)), exist_ok=True)
+        self._path_key = os.path.abspath(self.lock_path)
+        self._tid = threading.get_ident()
+
+        with _LOCK_STATE_GUARD:
+            state = _LOCK_STATE.get(self._path_key)
+            if state and state["tid"] == self._tid and state["depth"] > 0:
+                state["depth"] += 1
+                self._reentrant = True
+                self.fd = state["fd"]
+                return self
+
+        os.makedirs(os.path.dirname(self._path_key), exist_ok=True)
         # 必须以 a+b 打开，严禁使用 "w" (会清空文件且破坏并发中的文件句柄)
-        self.fd = open(self.lock_path, "a+b")
+        self.fd = open(self._path_key, "a+b")
         start_time = time.time()
 
         if sys.platform == "win32":
             import msvcrt
-            self.fd.seek(0)
             while True:
                 try:
+                    self.fd.seek(0)
                     msvcrt.locking(self.fd.fileno(), msvcrt.LK_NBLCK, 1)
                     self._locked = True
-                    return self
+                    break
                 except (BlockingIOError, OSError):
                     if time.time() - start_time >= self.timeout:
                         self.fd.close()
@@ -114,7 +157,7 @@ class SingleFlightFileLock:
                 try:
                     fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     self._locked = True
-                    return self
+                    break
                 except (BlockingIOError, OSError):
                     if time.time() - start_time >= self.timeout:
                         self.fd.close()
@@ -122,7 +165,23 @@ class SingleFlightFileLock:
                         raise TimeoutError(f"获取单飞文件排他锁超时 ({self.timeout}s): {self.lock_path}")
                     time.sleep(0.1)
 
+        with _LOCK_STATE_GUARD:
+            _LOCK_STATE[self._path_key] = {"tid": self._tid, "depth": 1, "fd": self.fd}
+        return self
+
     def __exit__(self, exc_type, exc_val, exc_tb):
+        if self._reentrant:
+            with _LOCK_STATE_GUARD:
+                state = _LOCK_STATE.get(self._path_key)
+                if state and state["tid"] == self._tid:
+                    state["depth"] -= 1
+            self.fd = None
+            self._reentrant = False
+            return
+
+        with _LOCK_STATE_GUARD:
+            _LOCK_STATE.pop(self._path_key, None)
+
         if self.fd:
             try:
                 if self._locked:
@@ -143,22 +202,24 @@ class SingleFlightFileLock:
                 self.fd = None
                 self._locked = False
 
+
 # -----------------------------------------------------------------------------
 # 基础日志与安全脱敏工具 (Zero-Leak)
 # -----------------------------------------------------------------------------
 def md5(s):
     return hashlib.md5(s.encode("utf-8")).hexdigest()
 
+
 def sanitize_token(text):
     if not text:
         return ""
     return REDACT_PATTERN.sub("<REDACTED_TOKEN>", str(text))
 
+
 def log(msg, to_stdout=True, to_file=True):
     ts = datetime.now(TZ_SHANGHAI).strftime("%Y-%m-%d %H:%M:%S")
     clean_msg = sanitize_token(msg)
-    for c in [COLOR_GREEN, COLOR_YELLOW, COLOR_CYAN, COLOR_RED, COLOR_BOLD, COLOR_DIM, COLOR_RESET]:
-        clean_msg = clean_msg.replace(c, "")
+    clean_msg = ANSI_RE.sub("", clean_msg)
     line = f"[{ts}] {clean_msg}"
     if to_file:
         try:
@@ -175,14 +236,86 @@ def log(msg, to_stdout=True, to_file=True):
     if to_stdout:
         print(sanitize_token(msg))
 
+
 def format_timestamp(ms):
     if not ms:
         return "未知"
     try:
-        dt = datetime.fromtimestamp(ms / 1000.0, tz=TZ_SHANGHAI)
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
+        return datetime.fromtimestamp(ms / 1000.0, tz=TZ_SHANGHAI).strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         return "未知"
+
+
+def xml_escape(text):
+    """最小 XML 转义（不依赖 xml/plistlib 模块，规避 pyexpat 缺失的发行版）"""
+    return (str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace('"', "&quot;").replace("'", "&apos;"))
+
+
+def display_width(text):
+    return len(ANSI_RE.sub("", str(text)))
+
+
+def pad(text, width):
+    text = str(text)
+    return text + " " * max(0, width - display_width(text))
+
+
+def read_state():
+    data = load_json(STATE_PATH)
+    return data if isinstance(data, dict) else {}
+
+
+def write_state(patch):
+    try:
+        state = read_state()
+        state.update(patch)
+        state["_updated_at"] = int(time.time() * 1000)
+        atomic_save_json(STATE_PATH, state)
+    except Exception:
+        pass
+
+
+def prompt_input(text):
+    """交互式输入的安全边界：无 TTY / Ctrl-C 时返回 None，绝不抛 EOFError"""
+    try:
+        return input(text)
+    except (EOFError, KeyboardInterrupt):
+        print("")
+        return None
+
+
+def has_flag(args, *names):
+    for a in args:
+        for n in names:
+            if a == n or a.startswith(n + "="):
+                return True
+    return False
+
+
+def flag_value(args, name, default=None):
+    for idx, a in enumerate(args):
+        if a == name and idx + 1 < len(args):
+            return args[idx + 1]
+        if a.startswith(name + "="):
+            return a.split("=", 1)[1]
+    return default
+
+
+def positional_args(args):
+    skip_next = False
+    out = []
+    for a in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if a.startswith("-"):
+            if "=" not in a and a in ("--mode",):
+                skip_next = True
+            continue
+        out.append(a)
+    return out
+
 
 # -----------------------------------------------------------------------------
 # 凭据存储与管理 (严格落实 Sync-before-switch 与原子写防损铁律)
@@ -196,6 +329,7 @@ def load_json(path):
     except Exception as e:
         log(f"{COLOR_YELLOW}[警告]{COLOR_RESET} 解析 JSON 异常 ({path}): {e}", to_file=True, to_stdout=False)
         return None
+
 
 def atomic_save_json(path, data):
     """原子落盘：通过安全掩码创建临时文件 -> fsync 刷盘 -> 具备重试的原子替换"""
@@ -233,6 +367,7 @@ def atomic_save_json(path, data):
                 raise
             time.sleep(0.05)
 
+
 def get_record_from_auth(auth_data):
     if not auth_data or not isinstance(auth_data, dict):
         return None, None
@@ -244,38 +379,50 @@ def get_record_from_auth(auth_data):
             return k, v
     return None, None
 
+
 def extract_account_meta(record):
     """从 Token 或 Record 中解析安全可展示的元数据 (脱敏)"""
     if not record or not isinstance(record, dict):
         return {
-            "userId": "(无记录)",
-            "userName": "(无记录)",
+            "userId": "",
+            "userName": "",
             "generation": 0,
             "expiresAtMs": 0,
-            "loginEpoch": ""
+            "loginEpoch": "",
         }
     token = record.get("accessToken", "") or ""
-    user_id = record.get("userId", "") or ""
+    user_id = record.get("userId", "") or record.get("_toolkit_user_id", "") or ""
     user_name = record.get("userName", "") or ""
 
-    if not user_id and token.startswith("ey"):
+    # MiniMax 生产 token 为不透明 mmoat_ 串，仅当能拿到 JWT 时才解析
+    if not user_id and isinstance(token, str) and token.startswith("eyJ"):
         parts = token.split(".")
         if len(parts) >= 2:
             try:
                 padded = parts[1] + "=" * ((4 - len(parts[1]) % 4) % 4)
                 payload = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
-                user_info = payload.get("user", {})
-                user_id = user_info.get("id", "") or ""
+                user_info = payload.get("user", {}) or {}
+                user_id = user_info.get("id", "") or payload.get("sub", "") or ""
                 user_name = user_info.get("name", "") or ""
             except Exception:
                 pass
     return {
-        "userId": str(user_id) if user_id else "(未解析UID)",
+        "userId": str(user_id) if user_id else "",
         "userName": str(user_name) if user_name else "MiniMax用户",
         "generation": record.get("generation", 1),
         "expiresAtMs": record.get("expiresAtMs", 0),
         "loginEpoch": record.get("loginEpoch", "")
     }
+
+
+def user_display(meta):
+    raw_uid = str(meta.get("userId") or "")
+    uid_short = (raw_uid[:8] + "..") if len(raw_uid) > 8 else raw_uid
+    user_name = str(meta.get("userName") or "MiniMax用户")
+    if uid_short:
+        return f"{user_name} ({uid_short})"
+    return user_name
+
 
 def sync_active_to_profile():
     """【铁律防御】切号前必须持锁先将活跃凭据写回 Profile，防止覆盖运行期刷新的新 Token"""
@@ -305,6 +452,7 @@ def sync_active_to_profile():
             profile_data["_updated_at"] = int(time.time() * 1000)
             atomic_save_json(p_path, profile_data)
 
+
 def get_profile_path(alias):
     raw_str = str(alias).strip()
     if "/" in raw_str or "\\" in raw_str or ".." in raw_str:
@@ -313,6 +461,7 @@ def get_profile_path(alias):
     if not ALIAS_PATTERN.match(clean):
         raise ValueError(f"非法的账号别名 [{alias}]，仅允许 1~64 位的英文字母、数字、下划线及减号")
     return os.path.join(AUTH_PROFILES_DIR, f"{clean}.json")
+
 
 def list_profiles():
     os.makedirs(AUTH_PROFILES_DIR, exist_ok=True)
@@ -328,13 +477,14 @@ def list_profiles():
             files = ["main.json"]
     return sorted([f[:-5] for f in files])
 
+
 def get_current_alias():
     if not os.path.exists(ACTIVE_AUTH_PATH):
         return None
     active = load_json(ACTIVE_AUTH_PATH)
     if not active:
         return None
-    if "_toolkit_alias" in active:
+    if active.get("_toolkit_alias"):
         return active["_toolkit_alias"]
     _, rec = get_record_from_auth(active)
     if not rec:
@@ -344,7 +494,19 @@ def get_current_alias():
         _, p_rec = get_record_from_auth(p_data)
         if p_rec and p_rec.get("refreshToken") == rec.get("refreshToken"):
             return p
-    return "default"
+    return None
+
+
+def resolve_alias(alias):
+    """校验别名并返回 (clean_alias, path)；非法时打印友好错误并返回 (None, None)"""
+    try:
+        path = get_profile_path(alias)
+    except ValueError as e:
+        print(f"{COLOR_RED}错误: {e}{COLOR_RESET}")
+        return None, None
+    clean = os.path.basename(path)[:-5]
+    return clean, path
+
 
 # -----------------------------------------------------------------------------
 # OAuth 2.0 自动续期与网关协议引擎
@@ -397,8 +559,8 @@ def refresh_token_if_needed(auth_data, alias=None):
             sanitized_err = sanitize_token(err_msg)
             log(f"{COLOR_RED}[OAuth 错误]{COLOR_RESET} 刷新 Token 失败 (HTTP {e.code}): {sanitized_err}")
             raise RuntimeError(f"Token refresh failed (HTTP {e.code}): {sanitized_err}")
-        except urllib.error.URLError as e:
-            sanitized_err = sanitize_token(str(e.reason))
+        except Exception as e:
+            sanitized_err = sanitize_token(str(getattr(e, "reason", e)))
             log(f"{COLOR_RED}[OAuth 网络错误]{COLOR_RESET} 连接失败: {sanitized_err}")
             raise RuntimeError(f"Token refresh network error: {sanitized_err}")
 
@@ -445,8 +607,10 @@ def refresh_token_if_needed(auth_data, alias=None):
             active_disk["_updated_at"] = now_ms
             atomic_save_json(ACTIVE_AUTH_PATH, active_disk)
 
+        write_state({"last_refresh_at": now_ms})
         log(f"{COLOR_GREEN}[OAuth]{COLOR_RESET} 凭据换新成功！有效期至: {format_timestamp(new_expires_at)}")
         return new_access_token, True
+
 
 def call_minimax_gateway(path, method="GET", body=None, token=None, device_uuid=None, user_id=None):
     now_ms = int(time.time() * 1000)
@@ -498,8 +662,8 @@ def call_minimax_gateway(path, method="GET", body=None, token=None, device_uuid=
     full_url = f"{GATEWAY_BASE}{hasSearchParamsPath}"
     req = urllib.request.Request(full_url, data=body_bytes, method=method)
     req.add_header("User-Agent", "MiniMaxAgent Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
-    req.add_header("Origin", "https://agent.minimax.cn")
-    req.add_header("Referer", "https://agent.minimax.cn/")
+    req.add_header("Origin", GATEWAY_BASE)
+    req.add_header("Referer", f"{GATEWAY_BASE}/")
     req.add_header("Accept", "application/json, text/plain, */*")
     req.add_header("Content-Type", "application/json")
     if token:
@@ -526,25 +690,54 @@ def call_minimax_gateway(path, method="GET", body=None, token=None, device_uuid=
             if attempt < max_retries:
                 time.sleep(1.0 * (attempt + 1))
                 continue
-            raise RuntimeError(f"MiniMax 网关网络连接失败: {e.reason}")
+            raise RuntimeError(f"MiniMax 网关网络连接失败: {getattr(e, 'reason', e)}")
+        except (json.JSONDecodeError, ValueError) as e:
+            raise RuntimeError(f"MiniMax 网关响应不是合法 JSON: {e}")
+
 
 # -----------------------------------------------------------------------------
 # 命令实现：RFC 8628 设备码授权登录 (`minimax login <alias>`)
 # -----------------------------------------------------------------------------
-def cmd_login(alias=None):
-    if not alias:
-        alias = input("请输入要绑定的账号别名 (例如: main / work / backup): ").strip()
-        if not alias:
-            print(f"{COLOR_RED}错误: 账号别名不能为空。{COLOR_RESET}")
-            return 1
+def _next_auto_alias():
+    existing = set(list_profiles())
+    idx = 1
+    while f"account_{idx}" in existing:
+        idx += 1
+    return f"account_{idx}"
 
-    clean_alias = os.path.basename(alias).replace(".json", "")
-    target_path = get_profile_path(clean_alias)
-    if os.path.exists(target_path):
-        override = input(f"账号 [{clean_alias}] 已存在，是否覆盖更新? (y/N): ").strip().lower()
-        if override != "y":
+
+def cmd_login(args):
+    force = has_flag(args, "--force", "-f")
+    no_browser = has_flag(args, "--no-browser") or os.environ.get("MINIMAX_NO_BROWSER") == "1"
+    given = positional_args(args)
+    alias = given[0] if given else None
+
+    if not alias:
+        if sys.stdin.isatty():
+            default_alias = _next_auto_alias()
+            entered = prompt_input(f"请输入要绑定的账号别名 [{default_alias}]: ")
+            if entered is None:
+                print("已取消登录。")
+                return EXIT_ERROR
+            alias = entered.strip() or default_alias
+        else:
+            alias = _next_auto_alias()
+
+    clean_alias, target_path = resolve_alias(alias)
+    if not clean_alias:
+        return EXIT_USAGE
+
+    if os.path.exists(target_path) and not force:
+        if not sys.stdin.isatty():
+            print(f"{COLOR_RED}错误: 账号 [{clean_alias}] 已存在。非交互环境下请追加 --force 覆盖。{COLOR_RESET}")
+            return EXIT_USAGE
+        override = prompt_input(f"账号 [{clean_alias}] 已存在，是否覆盖更新? (y/N): ")
+        if override is None:
             print("已取消登录。")
-            return 0
+            return EXIT_ERROR
+        if override.strip().lower() not in ("y", "yes"):
+            print("已取消登录。")
+            return EXIT_OK
 
     print(f"\n{COLOR_BOLD}{COLOR_CYAN}=== MiniMax 账号免扫码网页授权 (RFC 8628 Device Flow) ==={COLOR_RESET}")
     print(f"正在为账号 [{COLOR_BOLD}{clean_alias}{COLOR_RESET}] 申请授权会话...")
@@ -569,25 +762,37 @@ def cmd_login(alias=None):
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = sanitize_token(e.read().decode("utf-8", errors="ignore"))
+        print(f"{COLOR_RED}申请设备授权码失败 (HTTP {e.code}): {body[:200]}{COLOR_RESET}")
+        return EXIT_ERROR
     except Exception as e:
-        print(f"{COLOR_RED}申请设备授权码失败: {e}{COLOR_RESET}")
-        return 1
+        print(f"{COLOR_RED}申请设备授权码失败: {sanitize_token(e)}{COLOR_RESET}")
+        return EXIT_ERROR
 
     device_code = data.get("device_code")
     user_code = data.get("user_code")
     verify_url = data.get("verification_uri_complete") or data.get("verification_uri")
-    interval = max(int(data.get("interval", 3)), 2)
-    expires_in = int(data.get("expires_in", 300))
+    if not device_code or not verify_url:
+        print(f"{COLOR_RED}设备授权响应缺少必要字段，请稍后重试。{COLOR_RESET}")
+        return EXIT_ERROR
+
+    try:
+        interval = max(int(data.get("interval", 5)), 1)
+        expires_in = max(int(data.get("expires_in", 300)), 10)
+    except (TypeError, ValueError):
+        interval, expires_in = 5, 300
 
     print(f"\n{COLOR_GREEN}✔ 授权会话已就绪！{COLOR_RESET}")
     print(f"  • 用户验证码: {COLOR_BOLD}{COLOR_YELLOW}{user_code}{COLOR_RESET}")
     print(f"  • 授权地址:   {COLOR_CYAN}{verify_url}{COLOR_RESET}")
     print(f"\n正在自动拉起默认浏览器进行授权，若未自动打开请手动复制上方链接...")
 
-    try:
-        webbrowser.open(verify_url)
-    except Exception:
-        pass
+    if not no_browser:
+        try:
+            webbrowser.open(verify_url)
+        except Exception:
+            pass
 
     print(f"{COLOR_DIM}正在等待网页端授权确认 (超时时间: {expires_in} 秒)...{COLOR_RESET}")
     start_time = time.time()
@@ -616,26 +821,31 @@ def cmd_login(alias=None):
             if "authorization_pending" in err_body:
                 print(".", end="", flush=True)
                 continue
-            elif "slow_down" in err_body:
+            if "slow_down" in err_body:
                 interval += 2
                 continue
-            else:
-                print(f"\n{COLOR_RED}授权失败 (HTTP {te.code}): {err_body}{COLOR_RESET}")
-                return 1
+            if "access_denied" in err_body or "expired_token" in err_body:
+                print(f"\n{COLOR_RED}授权已拒绝或会话已过期，请重新执行 login。{COLOR_RESET}")
+                return EXIT_ERROR
+            print(f"\n{COLOR_RED}授权失败 (HTTP {te.code}): {sanitize_token(err_body)[:200]}{COLOR_RESET}")
+            return EXIT_ERROR
         except Exception as e:
-            print(f"\n{COLOR_RED}网络异常: {e}{COLOR_RESET}")
-            return 1
+            print(f"\n{COLOR_RED}网络异常: {sanitize_token(e)}{COLOR_RESET}")
+            return EXIT_ERROR
 
     print("")
     if not token_data or "access_token" not in token_data:
         print(f"\n{COLOR_RED}授权超时或未完成，请重试。{COLOR_RESET}")
-        return 1
+        return EXIT_ERROR
 
     now_ms = int(time.time() * 1000)
     access_token = token_data.get("access_token")
-    refresh_token = token_data.get("refresh_token")
-    expires_in_sec = token_data.get("expires_in", 3600)
-    expires_at_ms = now_ms + int(expires_in_sec * 1000)
+    refresh_token = token_data.get("refresh_token") or ""
+    try:
+        expires_in_sec = int(token_data.get("expires_in", 3600))
+    except (TypeError, ValueError):
+        expires_in_sec = 3600
+    expires_at_ms = now_ms + expires_in_sec * 1000
 
     record_hash = secrets.token_urlsafe(32)
     record_key = f"com.minimax.mcode.oauth.prod.cn\u0000{record_hash}"
@@ -660,6 +870,9 @@ def cmd_login(alias=None):
         }
     }
 
+    if token_data.get("user_id"):
+        profile_content["records"][record_key]["userId"] = str(token_data["user_id"])
+
     atomic_save_json(target_path, profile_content)
 
     if not os.path.exists(ACTIVE_AUTH_PATH):
@@ -669,21 +882,33 @@ def cmd_login(alias=None):
     meta = extract_account_meta(profile_content["records"][record_key])
     print(f"\n{COLOR_BOLD}{COLOR_GREEN}🎉 账号 [{clean_alias}] 绑定成功！{COLOR_RESET}")
     print(f"  • 凭据路径:   {target_path}")
-    print(f"  • 用户标识:   {meta['userName']} ({meta['userId']})")
+    print(f"  • 用户标识:   {user_display(meta)}")
     print(f"  • Token 有效: 至 {format_timestamp(expires_at_ms)}")
-    return 0
+    return EXIT_OK
+
 
 # -----------------------------------------------------------------------------
 # 命令实现：账号切换 (`minimax switch [alias]`) - Sync-before-switch 铁律
 # -----------------------------------------------------------------------------
-def cmd_switch(alias=None):
+def cmd_switch(args):
+    given = positional_args(args)
+    alias = given[0] if given else None
+    assume_yes = has_flag(args, "--yes", "-y")
+
+    # 无 TTY 且未指定别名时，交互式菜单不可用：立即给出确定性用法错误
+    if not alias and not sys.stdin.isatty():
+        profiles = list_profiles()
+        print(f"{COLOR_RED}非交互环境无法使用交互式选择，请显式指定: minimax switch <alias>{COLOR_RESET}")
+        print(f"可用账号: {', '.join(profiles) if profiles else '无'}")
+        return EXIT_USAGE
+
     with SingleFlightFileLock(LOCK_FILE_PATH):
         profiles = list_profiles()
         current_alias = get_current_alias()
 
         if not profiles:
             print(f"{COLOR_YELLOW}当前尚未录入任何账号。请先运行: minimax login <alias>{COLOR_RESET}")
-            return 1
+            return EXIT_ERROR
 
         if not alias:
             print(f"\n{COLOR_BOLD}{COLOR_CYAN}=== MiniMax 账号切换控制中心 ==={COLOR_RESET}")
@@ -694,33 +919,40 @@ def cmd_switch(alias=None):
                 _, rec = get_record_from_auth(p_data)
                 meta = extract_account_meta(rec)
                 exp = format_timestamp(meta.get("expiresAtMs"))
-                print(f"  {COLOR_BOLD}{idx}.{COLOR_RESET} {p:<15} {meta.get('userName')} ({meta.get('userId')}) | 到期: {exp} {tag}")
+                print(f"  {COLOR_BOLD}{idx}.{COLOR_RESET} {p:<15} {user_display(meta)} | 到期: {exp} {tag}")
 
-            choice = input(f"\n请选择要切换的账号序号 (1-{len(profiles)}) [q 退出]: ").strip()
+            if not sys.stdin.isatty():
+                print(f"\n{COLOR_RED}非交互环境无法选择序号，请显式指定: minimax switch <alias>{COLOR_RESET}")
+                print(f"可用账号: {', '.join(profiles)}")
+                return EXIT_USAGE
+
+            choice = prompt_input(f"\n请选择要切换的账号序号 (1-{len(profiles)}) [q 退出]: ")
+            if choice is None:
+                print("已取消切换。")
+                return EXIT_ERROR
+            choice = choice.strip()
             if choice.lower() in ("q", "quit", "exit", ""):
                 print("已取消切换。")
-                return 0
+                return EXIT_OK
             try:
                 sel_idx = int(choice) - 1
                 if 0 <= sel_idx < len(profiles):
                     alias = profiles[sel_idx]
                 else:
                     print(f"{COLOR_RED}无效序号。{COLOR_RESET}")
-                    return 1
+                    return EXIT_USAGE
             except ValueError:
                 print(f"{COLOR_RED}请输入合法数字序号。{COLOR_RESET}")
-                return 1
+                return EXIT_USAGE
 
-        clean_alias = os.path.basename(str(alias)).replace(".json", "")
-        if not ALIAS_PATTERN.match(clean_alias):
-            print(f"{COLOR_RED}错误: 非法的账号别名 [{alias}]，仅允许 1~64 位的英文字母、数字、下划线及减号。{COLOR_RESET}")
-            return 1
+        clean_alias, target_path = resolve_alias(alias)
+        if not clean_alias:
+            return EXIT_USAGE
 
-        target_path = get_profile_path(clean_alias)
         if not os.path.exists(target_path):
             print(f"{COLOR_RED}错误: 未找到账号 [{clean_alias}] 的凭据文件 ({target_path})。{COLOR_RESET}")
             print(f"可用账号列表: {', '.join(profiles)}")
-            return 1
+            return EXIT_ERROR
 
         # 1. 锁内同步当前活跃凭据至 Profile
         sync_active_to_profile()
@@ -730,49 +962,119 @@ def cmd_switch(alias=None):
         rec_key, rec = get_record_from_auth(target_auth)
         if not rec:
             print(f"{COLOR_RED}错误: 账号 [{clean_alias}] 的凭据文件损坏，未包含有效 Token。{COLOR_RESET}")
-            return 1
+            return EXIT_ERROR
 
-        try:
-            refresh_token_if_needed(target_auth, alias=clean_alias)
-        except Exception as e:
-            print(f"{COLOR_YELLOW}警告: 自动刷新目标 Token 出现异常 ({e})，继续尝试激活...{COLOR_RESET}")
+        if not assume_yes:
+            try:
+                refresh_token_if_needed(target_auth, alias=clean_alias)
+            except Exception as e:
+                print(f"{COLOR_YELLOW}警告: 目标 Token 续期失败 ({sanitize_token(e)})，仍将激活该账号。{COLOR_RESET}")
 
         target_auth["_toolkit_alias"] = clean_alias
         target_auth["_switched_at"] = int(time.time() * 1000)
         atomic_save_json(ACTIVE_AUTH_PATH, target_auth)
 
-        meta = extract_account_meta(target_auth["records"][rec_key])
+        # 回写 profile 的切换时间，便于审计
+        profile_data = load_json(target_path) or {}
+        profile_data["_last_switch_at"] = target_auth["_switched_at"]
+        profile_data["_toolkit_alias"] = clean_alias
+        atomic_save_json(target_path, profile_data)
+
+        meta = extract_account_meta(rec)
         print(f"\n{COLOR_GREEN}✔ 账号切换成功！当前活跃账号: {COLOR_BOLD}[{clean_alias}]{COLOR_RESET}")
-        print(f"  • 用户身份: {meta['userName']} ({meta['userId']})")
+        print(f"  • 用户身份: {user_display(meta)}")
         print(f"  • 凭据代数: Generation {meta.get('generation', 1)}")
         print(f"  • 活跃路径: {ACTIVE_AUTH_PATH}")
-        return 0
+        return EXIT_OK
+
 
 # -----------------------------------------------------------------------------
 # 命令实现：账号清单与状态审计 (`minimax list`, `minimax audit`)
 # -----------------------------------------------------------------------------
-def cmd_list():
+def probe_signin_status(token, user_id=None):
+    """调用签到状态接口，返回 (ok, data_or_error)"""
+    resp = call_minimax_gateway("/minimax-cloud/api/v1/signin/status", method="GET", token=token, user_id=user_id)
+    if resp.get("base_resp", {}).get("status_code") != 0:
+        return False, resp.get("base_resp", {}).get("status_msg", "未知错误")
+    return True, resp.get("data", {})
+
+
+STATUS_MAP = {1: "未开始", 2: "待领取", 3: "已签到", 4: "已失效"}
+STATUS_MAP_EN = {1: "upcoming", 2: "claimable", 3: "claimed", 4: "disabled"}
+
+
+def profile_status_snapshot(p, offline=False):
+    p_data = load_json(get_profile_path(p))
+    _, rec = get_record_from_auth(p_data)
+    meta = extract_account_meta(rec)
+    now_ms = int(time.time() * 1000)
+    snapshot = {
+        "alias": p,
+        "user_name": meta["userName"],
+        "user_id": meta["userId"],
+        "generation": meta["generation"],
+        "expires_at_ms": meta["expiresAtMs"],
+        "expired": meta["expiresAtMs"] < now_ms,
+        "status": "unknown",
+        "status_code": None,
+        "day_no": None,
+        "points": None,
+        "error": None,
+    }
+    if offline or not rec or snapshot["expired"]:
+        return snapshot
+
+    try:
+        ok, data = probe_signin_status(rec["accessToken"], meta["userId"] or None)
+        if not ok:
+            snapshot["error"] = str(data)
+            return snapshot
+        days = data.get("days", []) or []
+        today_item = next((d for d in days if d.get("is_today")), None)
+        if today_item:
+            snapshot["status_code"] = today_item.get("status")
+            snapshot["status"] = STATUS_MAP_EN.get(today_item.get("status"), "unknown")
+            snapshot["day_no"] = today_item.get("day_no")
+            snapshot["points"] = (today_item.get("points", 0) or 0) + (today_item.get("bonus_points", 0) or 0)
+    except Exception as e:
+        snapshot["error"] = sanitize_token(e)
+    return snapshot
+
+
+def cmd_list(args):
+    offline = has_flag(args, "--offline", "--no-network")
+    as_json = has_flag(args, "--json")
     profiles = list_profiles()
     current_alias = get_current_alias()
+
+    snapshots = [profile_status_snapshot(p, offline=offline) for p in profiles]
+    for snap in snapshots:
+        snap["current"] = (snap["alias"] == current_alias)
+
+    if as_json:
+        print(json.dumps({
+            "current": current_alias,
+            "count": len(profiles),
+            "accounts": snapshots,
+        }, ensure_ascii=False, indent=2))
+        return EXIT_OK
 
     print(f"\n{COLOR_BOLD}{COLOR_CYAN}=== MiniMax 纳管账号清单 ({len(profiles)} 个账号) ==={COLOR_RESET}")
     if not profiles:
         print(f"  {COLOR_YELLOW}(空) 暂无任何录入账号。请运行: minimax login <alias>{COLOR_RESET}\n")
-        return 0
-
-    print(f"{'别名':<14} {'用户标识':<22} {'凭据代数':<8} {'Token有效期':<20} {'今日状态':<14}")
-    print("-" * 80)
+        return EXIT_OK
 
     now_ms = int(time.time() * 1000)
-    for p in profiles:
-        p_path = get_profile_path(p)
-        p_data = load_json(p_path)
-        _, rec = get_record_from_auth(p_data)
-        meta = extract_account_meta(rec)
-        is_curr = (p == current_alias)
-        name_tag = f"{COLOR_BOLD}{COLOR_GREEN}*{p}{COLOR_RESET}" if is_curr else f" {p}"
+    header = (pad("别名", 16) + pad("用户标识", 26) + pad("凭据代数", 10)
+              + pad("Token有效期", 22) + "今日状态")
+    print(f"{COLOR_BOLD}{header}{COLOR_RESET}")
+    print("-" * 92)
 
-        exp_ms = meta.get("expiresAtMs", 0)
+    for snap in snapshots:
+        p = snap["alias"]
+        name_tag = f"{COLOR_BOLD}{COLOR_GREEN}*{p}{COLOR_RESET}" if snap["current"] else f" {p}"
+
+        exp_ms = snap["expires_at_ms"]
         exp_str = format_timestamp(exp_ms)
         if exp_ms < now_ms:
             exp_display = f"{COLOR_RED}已过期{COLOR_RESET}"
@@ -781,57 +1083,85 @@ def cmd_list():
         else:
             exp_display = f"{COLOR_GREEN}{exp_str}{COLOR_RESET}"
 
-        status_tag = f"{COLOR_DIM}未查询{COLOR_RESET}"
-        token = rec.get("accessToken") if rec else None
-        if token and exp_ms > now_ms:
-            try:
-                s_resp = call_minimax_gateway("/minimax-cloud/api/v1/signin/status", method="GET", token=token, user_id=meta.get("userId"))
-                if s_resp.get("base_resp", {}).get("status_code") == 0:
-                    days = s_resp.get("data", {}).get("days", [])
-                    today_item = next((d for d in days if d.get("is_today")), None)
-                    if today_item:
-                        st = today_item.get("status")
-                        st_map = {1: f"{COLOR_YELLOW}未开始{COLOR_RESET}", 2: f"{COLOR_CYAN}待领取{COLOR_RESET}", 3: f"{COLOR_GREEN}已签到✔{COLOR_RESET}", 4: f"{COLOR_RED}失效{COLOR_RESET}"}
-                        status_tag = st_map.get(st, f"码{st}")
-            except Exception:
-                status_tag = f"{COLOR_DIM}探针受限{COLOR_RESET}"
+        if offline:
+            status_tag = f"{COLOR_DIM}已跳过(--offline){COLOR_RESET}"
+        elif snap["status"] == "claimed":
+            status_tag = f"{COLOR_GREEN}已签到✔{COLOR_RESET}"
+        elif snap["status"] == "claimable":
+            status_tag = f"{COLOR_CYAN}待领取{COLOR_RESET}"
+        elif snap["status"] in ("upcoming", "disabled"):
+            status_tag = f"{COLOR_YELLOW}{STATUS_MAP.get(snap['status_code'], '未开始')}{COLOR_RESET}"
+        elif snap["error"]:
+            status_tag = f"{COLOR_DIM}探针受限{COLOR_RESET}"
+        else:
+            status_tag = f"{COLOR_DIM}未查询{COLOR_RESET}"
 
-        raw_uid = str(meta.get("userId") or "未知")
-        uid_short = (raw_uid[:8] + "..") if len(raw_uid) > 8 else raw_uid
-        user_name = str(meta.get("userName") or "MiniMax用户")
-        user_display = f"{user_name} ({uid_short})"
-        gen_str = f"Gen {meta.get('generation', 1)}"
-        print(f"{name_tag:<22} {user_display:<22} {gen_str:<8} {exp_display:<28} {status_tag}")
+        gen_str = f"Gen {snap['generation']}"
+        print(f"{pad(name_tag, 16)} {pad(user_display(snap), 26)} {pad(gen_str, 10)} {pad(exp_display, 31)} {status_tag}")
 
-    print("-" * 80)
-    print(f"{COLOR_DIM}* 标注星号为当前活跃全局账号。切换命令: minimax switch <alias>{COLOR_RESET}\n")
-    return 0
+    print("-" * 92)
+    print(f"{COLOR_DIM}* 标注星号为当前活跃全局账号。切换命令: minimax switch <alias>{COLOR_RESET}")
+    print(f"{COLOR_DIM}离线查看（不发起网络请求）: minimax list --offline | 机器可读: minimax list --json{COLOR_RESET}\n")
+    return EXIT_OK
 
-def cmd_audit(target="--all"):
-    profiles = list_profiles() if target in ("--all", "all", None) else [target]
+
+def cmd_audit(args):
+    profiles = list_profiles()
+    targets = profiles
+    given = positional_args(args)
+    if given and given[0] not in ("--all", "all"):
+        clean, path = resolve_alias(given[0])
+        if not clean:
+            return EXIT_USAGE
+        if clean not in profiles:
+            print(f"{COLOR_RED}错误: 未找到账号 [{clean}]。可用: {', '.join(profiles) if profiles else '无'}{COLOR_RESET}")
+            return EXIT_ERROR
+        targets = [clean]
+
     print(f"\n{COLOR_BOLD}{COLOR_CYAN}=== MiniMax 凭据健康审计与自愈保活 ==={COLOR_RESET}")
+    if not targets:
+        print(f"  {COLOR_YELLOW}暂无纳管账号。{COLOR_RESET}\n")
+        return EXIT_ERROR
 
-    for p in profiles:
+    failures = 0
+    refreshed = 0
+    for p in targets:
         p_path = get_profile_path(p)
         if not os.path.exists(p_path):
             print(f"  • [{p}]: {COLOR_RED}文件不存在{COLOR_RESET}")
+            failures += 1
             continue
         p_data = load_json(p_path)
-        _, rec = get_record_from_auth(p_data)
+        rec_key, rec = get_record_from_auth(p_data)
         meta = extract_account_meta(rec)
-        print(f"  • 账号 [{COLOR_BOLD}{p}{COLOR_RESET}] ({meta['userId']}): ", end="", flush=True)
+        print(f"  • 账号 [{COLOR_BOLD}{p}{COLOR_RESET}] ({user_display(meta)}): ", end="", flush=True)
+
+        if not rec:
+            print(f"{COLOR_RED}凭据损坏（无有效 OAuth 记录）{COLOR_RESET}")
+            failures += 1
+            continue
 
         try:
             _, did_refresh = refresh_token_if_needed(p_data, alias=p)
-            new_exp = format_timestamp(p_data["records"][list(p_data["records"].keys())[0]]["expiresAtMs"])
+            new_rec = p_data["records"].get(rec_key, rec)
+            new_exp = format_timestamp(new_rec.get("expiresAtMs"))
             if did_refresh:
+                refreshed += 1
                 print(f"{COLOR_GREEN}已完成无感续杯 (新有效期至: {new_exp}){COLOR_RESET}")
             else:
                 print(f"{COLOR_GREEN}有效健康 (有效期至: {new_exp}){COLOR_RESET}")
         except Exception as e:
-            print(f"{COLOR_RED}自愈失败: {e}{COLOR_RESET}")
+            print(f"{COLOR_RED}自愈失败: {sanitize_token(e)}{COLOR_RESET}")
+            failures += 1
+
+    if refreshed:
+        print(f"\n  {COLOR_GREEN}✔ 本次共滚动续期 {refreshed} 个账号。{COLOR_RESET}")
+    if failures:
+        print(f"\n  {COLOR_RED}✘ {failures} 个账号需要重新登录: minimax login <alias> --force{COLOR_RESET}\n")
+        return EXIT_ERROR
     print("")
-    return 0
+    return EXIT_OK
+
 
 # -----------------------------------------------------------------------------
 # 命令实现：详细打卡状态查询与多账号批量签到
@@ -844,54 +1174,52 @@ def checkin_single_profile(alias, only_status=False):
         return False, "NO_AUTH"
 
     rec_key, rec = get_record_from_auth(auth_data)
+    if not rec:
+        log(f"[{alias}] {COLOR_RED}凭据损坏: 未发现有效 OAuth2 记录{COLOR_RESET}")
+        return False, "NO_AUTH"
     meta = extract_account_meta(rec)
     user_id = meta.get("userId")
 
     try:
         token, _ = refresh_token_if_needed(auth_data, alias=alias)
     except Exception as e:
-        log(f"[{alias}] {COLOR_RED}Token 续期失败: {e}{COLOR_RESET}")
+        log(f"[{alias}] {COLOR_RED}Token 续期失败: {sanitize_token(e)}{COLOR_RESET}")
         return False, "TOKEN_EXPIRED"
 
     try:
-        status_resp = call_minimax_gateway("/minimax-cloud/api/v1/signin/status", method="GET", token=token, user_id=user_id)
+        ok, data = probe_signin_status(token, user_id or None)
     except Exception as e:
-        log(f"[{alias}] {COLOR_RED}请求状态 API 失败: {e}{COLOR_RESET}")
+        log(f"[{alias}] {COLOR_RED}请求状态 API 失败: {sanitize_token(e)}{COLOR_RESET}")
         return False, "NETWORK_ERR"
 
-    if status_resp.get("base_resp", {}).get("status_code") != 0:
-        msg = status_resp.get("base_resp", {}).get("status_msg", "未知错误")
-        log(f"[{alias}] {COLOR_RED}接口返回错误: {msg}{COLOR_RESET}")
-        return False, msg
+    if not ok:
+        log(f"[{alias}] {COLOR_RED}接口返回错误: {data}{COLOR_RESET}")
+        return False, f"API_ERROR: {data}"
 
-    data = status_resp.get("data", {})
-    days = data.get("days", [])
+    days = data.get("days", []) or []
     today_item = next((d for d in days if d.get("is_today")), None)
     if not today_item:
         log(f"[{alias}] {COLOR_YELLOW}未在面板中发现今日打卡项{COLOR_RESET}")
         return False, "NO_TODAY_ITEM"
 
     day_no = today_item.get("day_no")
-    points = today_item.get("points", 0)
-    bonus = today_item.get("bonus_points", 0)
+    points = today_item.get("points", 0) or 0
+    bonus = today_item.get("bonus_points", 0) or 0
     total_pts = points + bonus
     st = today_item.get("status")
 
-    st_map = {1: "未开始 (Upcoming)", 2: "待领取 (Claimable)", 3: "已签到 (Claimed)", 4: "已失效 (Disabled)"}
-    st_text = st_map.get(st, f"码 {st}")
-
-    log(f"  • 账号: [{COLOR_BOLD}{alias}{COLOR_RESET}] (UID: {user_id})")
+    log(f"  • 账号: [{COLOR_BOLD}{alias}{COLOR_RESET}] ({user_display(meta)})")
     log(f"    - 连签周期: Scene {data.get('scene', 2)} (Day {day_no} / 7)")
     log(f"    - 今日奖励: {points} 积分" + (f" + {bonus} 额外" if bonus else "") + f" = {total_pts} pts")
-    log(f"    - 当前状态: {st_text}")
+    log(f"    - 当前状态: {STATUS_MAP.get(st, f'码 {st}')}")
 
     if only_status:
-        return True, st_text
+        return True, STATUS_MAP_EN.get(st, "unknown")
 
     if st == 3:
         log(f"    {COLOR_GREEN}✔ 今日已经签到，积分已入账。{COLOR_RESET}")
         return True, "ALREADY_CLAIMED"
-    elif st == 2:
+    if st == 2:
         log(f"    {COLOR_CYAN}正在执行打卡 claim 领分...{COLOR_RESET}")
         try:
             claim_resp = call_minimax_gateway("/minimax-cloud/api/v1/signin/claim", method="POST", body={}, token=token, user_id=user_id)
@@ -900,186 +1228,607 @@ def checkin_single_profile(alias, only_status=False):
                 earned = cdata.get("points", total_pts)
                 log(f"    {COLOR_BOLD}{COLOR_GREEN}🎉 签到成功！成功获得 {earned} 积分！(Day {day_no}){COLOR_RESET}")
                 return True, "CLAIMED_SUCCESS"
-            else:
-                cmsg = claim_resp.get("base_resp", {}).get("status_msg", "领取请求失败")
-                log(f"    {COLOR_RED}✘ 领取失败: {cmsg}{COLOR_RESET}")
-                return False, cmsg
+            cmsg = claim_resp.get("base_resp", {}).get("status_msg", "领取请求失败")
+            log(f"    {COLOR_RED}✘ 领取失败: {cmsg}{COLOR_RESET}")
+            return False, f"CLAIM_FAILED: {cmsg}"
         except Exception as ce:
-            log(f"    {COLOR_RED}✘ 领取异常: {ce}{COLOR_RESET}")
-            return False, str(ce)
-    else:
-        log(f"    {COLOR_YELLOW}今日暂无可领取奖励 (状态: {st_text})。{COLOR_RESET}")
-        return True, "NO_CLAIMABLE"
+            log(f"    {COLOR_RED}✘ 领取异常: {sanitize_token(ce)}{COLOR_RESET}")
+            return False, f"CLAIM_ERROR: {sanitize_token(ce)}"
 
-def cmd_status(alias=None):
-    if not alias:
-        alias = get_current_alias()
+    log(f"    {COLOR_YELLOW}今日暂无可领取奖励 (状态: {STATUS_MAP.get(st, st)})。{COLOR_RESET}")
+    return True, "NO_CLAIMABLE"
+
+
+def cmd_status(args):
+    given = positional_args(args)
+    as_json = has_flag(args, "--json")
+    alias = given[0] if given else get_current_alias()
     if not alias:
         print(f"{COLOR_YELLOW}当前未配置活跃账号。请运行: minimax login <alias>{COLOR_RESET}")
-        return 1
+        return EXIT_ERROR
+
+    clean, path = resolve_alias(alias)
+    if not clean:
+        return EXIT_USAGE
+    if not os.path.exists(path):
+        print(f"{COLOR_RED}错误: 未找到账号 [{clean}]。可用: {', '.join(list_profiles()) or '无'}{COLOR_RESET}")
+        return EXIT_ERROR
+
+    if as_json:
+        snap = profile_status_snapshot(clean)
+        snap["current"] = clean == get_current_alias()
+        print(json.dumps(snap, ensure_ascii=False, indent=2))
+        return EXIT_OK
+
     print(f"\n{COLOR_BOLD}{COLOR_CYAN}=== MiniMax 账号详细签到与连签流水 ==={COLOR_RESET}")
-    checkin_single_profile(alias, only_status=True)
+    ok, reason = checkin_single_profile(clean, only_status=True)
     print("")
-    return 0
+    return EXIT_OK if ok else EXIT_ERROR
 
-def cmd_checkin(target="--all"):
-    log(f"{COLOR_BOLD}=== MiniMax Code 每日签到服务 (minimax-toolkit 调度器) ==={COLOR_RESET}")
+
+def cmd_checkin(args):
+    given = positional_args(args)
+    check_all = has_flag(args, "--all") or (given and given[0] in ("all", "--all"))
+
+    log(f"{COLOR_BOLD}=== MiniMax Code 每日签到服务 (minimax-toolkit {VERSION}) ==={COLOR_RESET}")
+
+    # 显式别名属于用法输入，优先于「无账号」判定进行校验
+    explicit_alias = given[0] if (given and not check_all) else None
+    explicit_path = None
+    if explicit_alias:
+        explicit_alias, explicit_path = resolve_alias(explicit_alias)
+        if not explicit_alias:
+            return EXIT_USAGE
+
     profiles = list_profiles()
-
-    if not profiles and os.path.exists(ACTIVE_AUTH_PATH):
-        active = load_json(ACTIVE_AUTH_PATH)
-        if active:
-            active["_toolkit_alias"] = "default"
-            atomic_save_json(get_profile_path("default"), active)
-            profiles = ["default"]
 
     if not profiles:
         log(f"{COLOR_YELLOW}未发现任何纳管账号，跳过签到。{COLOR_RESET}")
-        return 1
+        write_state({"last_run_at": int(time.time() * 1000), "last_run_result": "no_accounts"})
+        return EXIT_ERROR
 
-    targets = profiles if target in ("--all", "all", None) else [target]
-    success_count = 0
-    fail_count = 0
+    if check_all:
+        targets = profiles
+    else:
+        alias = explicit_alias or get_current_alias()
+        if not alias:
+            print(f"{COLOR_YELLOW}当前未配置活跃账号，请使用 minimax checkin --all 或 minimax checkin <alias>。{COLOR_RESET}")
+            return EXIT_ERROR
+        if explicit_alias:
+            clean, path = explicit_alias, explicit_path
+        else:
+            clean, path = resolve_alias(alias)
+        if not clean:
+            return EXIT_USAGE
+        if not os.path.exists(path):
+            print(f"{COLOR_RED}错误: 未找到账号 [{clean}]。可用: {', '.join(profiles)}{COLOR_RESET}")
+            return EXIT_ERROR
+        targets = [clean]
+
     claimed_count = 0
     already_count = 0
+    idle_count = 0
+    fail_count = 0
+    reasons = {}
 
     for idx, p in enumerate(targets, 1):
         log(f"\n{COLOR_BOLD}[{idx}/{len(targets)}] 正在处理账号: {p}{COLOR_RESET}")
         ok, reason = checkin_single_profile(p, only_status=False)
+        reasons[p] = reason
         if ok:
-            success_count += 1
             if reason == "CLAIMED_SUCCESS":
                 claimed_count += 1
             elif reason == "ALREADY_CLAIMED":
                 already_count += 1
+            else:
+                idle_count += 1
         else:
             fail_count += 1
 
+    ok_count = claimed_count + already_count + idle_count
+    now_ms = int(time.time() * 1000)
+    previous = read_state()
+    summary = {
+        "total": len(targets),
+        "claimed": claimed_count,
+        "already": already_count,
+        "idle": idle_count,
+        "failed": fail_count,
+        "reasons": reasons,
+    }
+
     log(f"\n{COLOR_BOLD}=== 签到汇总对账审计 ==={COLOR_RESET}")
     log(f"  • 处理账号总数: {len(targets)}")
-    log(f"  • 签到成功:     {claimed_count} 个")
+    log(f"  • 本次新签到:   {claimed_count} 个")
     log(f"  • 此前已打卡:   {already_count} 个")
+    log(f"  • 暂无可领取:   {idle_count} 个")
     log(f"  • 失败/异常:    {fail_count} 个")
 
-    if (success_count + fail_count) != len(targets):
-        log(f"{COLOR_RED}✘ 全局数学守恒硬断言失败: 处理总数 ({len(targets)}) != 成功数 ({success_count}) + 失败数 ({fail_count}){COLOR_RESET}")
-        raise RuntimeError(f"数学守恒违背: 处理总数 ({len(targets)}) != 成功 ({success_count}) + 失败 ({fail_count})")
+    # 全局数学守恒硬断言: 必须满足 total == claimed + already + idle + failed
+    if (ok_count + fail_count) != len(targets):
+        log(f"{COLOR_RED}✘ 全局数学守恒硬断言失败: 处理总数 ({len(targets)}) != 成功 ({ok_count}) + 失败 ({fail_count}){COLOR_RESET}")
+        write_state({"last_run_at": now_ms, "last_run_result": "invariant_violation", "last_run_summary": summary})
+        return EXIT_INVARIANT
 
-    log(f"{COLOR_GREEN}✔ 全量账号打卡对账完毕，守恒校验 100% 成立。{COLOR_RESET}\n")
-    return 0 if fail_count == 0 else 1
+    if fail_count == 0:
+        result = "ok"
+        log(f"{COLOR_GREEN}✔ 全量账号打卡对账完毕，守恒校验 100% 成立。{COLOR_RESET}\n")
+    else:
+        result = "partial" if ok_count else "failed"
+        log(f"{COLOR_YELLOW}△ 打卡结束，{fail_count} 个账号失败，请运行 minimax audit 排查。{COLOR_RESET}\n")
+
+    state_patch = {
+        "last_run_at": now_ms,
+        "last_run_result": result,
+        "last_run_summary": summary,
+    }
+    if fail_count == 0:
+        state_patch["last_success_at"] = now_ms
+    elif previous.get("last_success_at"):
+        state_patch["last_success_at"] = previous["last_success_at"]
+    write_state(state_patch)
+
+    return EXIT_OK if fail_count == 0 else EXIT_ERROR
+
+
+# -----------------------------------------------------------------------------
+# 定时任务纳管 (macOS launchd / Linux systemd user / Windows Task Scheduler)
+# -----------------------------------------------------------------------------
+def scheduler_cli_command():
+    """返回调度器应当执行的命令前缀（优先使用已安装的入口）"""
+    if sys.platform == "win32":
+        installed = os.path.join(MINIMAX_DIR, "bin", "minimax.cmd")
+        if os.path.exists(installed):
+            return [installed]
+        return [sys.executable, os.path.abspath(__file__)]
+    installed = os.path.join(HOME, ".local", "bin", "minimax")
+    if os.path.exists(installed):
+        try:
+            if not os.path.samefile(installed, os.path.abspath(__file__)):
+                return [installed]
+        except Exception:
+            return [installed]
+    return [sys.executable, os.path.abspath(__file__)]
+
+
+def launchd_plist_path():
+    return os.path.join(HOME, "Library", "LaunchAgents", f"{LAUNCHD_LABEL}.plist")
+
+
+def systemd_user_dir():
+    return os.path.join(HOME, ".config", "systemd", "user")
+
+
+def detect_scheduler():
+    """返回 {installed, mode, active, detail}"""
+    info = {"installed": False, "mode": None, "active": False, "detail": ""}
+    if sys.platform == "darwin":
+        path = launchd_plist_path()
+        info["installed"] = os.path.exists(path)
+        if not info["installed"]:
+            info["detail"] = f"未找到 {path}"
+            return info
+        try:
+            content = open(path, "r", encoding="utf-8").read()
+            info["mode"] = "calendar" if "StartCalendarInterval" in content else "boot"
+        except Exception as e:
+            info["detail"] = f"plist 读取失败: {e}"
+            info["mode"] = "calendar"
+        res = subprocess.run(["launchctl", "list"], capture_output=True, text=True, errors="replace")
+        info["active"] = res.returncode == 0 and LAUNCHD_LABEL in (res.stdout or "")
+        info["detail"] = "LaunchAgent 已加载" if info["active"] else "LaunchAgent 未加载"
+        return info
+
+    if sys.platform.startswith("linux"):
+        service = os.path.join(systemd_user_dir(), f"{SYSTEMD_UNIT}.service")
+        timer = os.path.join(systemd_user_dir(), f"{SYSTEMD_UNIT}.timer")
+        info["installed"] = os.path.exists(service) and os.path.exists(timer)
+        if not info["installed"]:
+            info["detail"] = f"未找到 {timer}"
+            return info
+        try:
+            content = open(timer, "r", encoding="utf-8").read()
+            info["mode"] = "calendar" if "OnCalendar=" in content else "boot"
+        except Exception:
+            info["mode"] = "calendar"
+        if shutil.which("systemctl"):
+            enabled = subprocess.run(["systemctl", "--user", "is-enabled", f"{SYSTEMD_UNIT}.timer"],
+                                     capture_output=True, text=True, errors="replace").stdout.strip()
+            active = subprocess.run(["systemctl", "--user", "is-active", f"{SYSTEMD_UNIT}.timer"],
+                                    capture_output=True, text=True, errors="replace").stdout.strip()
+            info["active"] = enabled == "enabled" and active == "active"
+            info["detail"] = f"enabled={enabled or 'unknown'}, active={active or 'unknown'}"
+        else:
+            info["detail"] = "系统缺少 systemctl，timer 文件已存在但未激活"
+        return info
+
+    if sys.platform == "win32":
+        active_names = []
+        for name in (WINDOWS_TASK_CALENDAR, WINDOWS_TASK_BOOT):
+            res = subprocess.run(["schtasks", "/query", "/tn", name], capture_output=True, text=True, errors="replace")
+            if res.returncode == 0:
+                active_names.append(name)
+        info["installed"] = bool(active_names)
+        if active_names:
+            info["active"] = True
+            info["mode"] = "calendar" if WINDOWS_TASK_CALENDAR in active_names else "boot"
+            info["detail"] = f"计划任务: {', '.join(active_names)}"
+        else:
+            info["detail"] = "未找到 MiniMax 计划任务"
+        return info
+
+    info["detail"] = f"不支持的平台: {sys.platform}"
+    return info
+
+
+def _launchd_unload_any(path=None):
+    """同时处理「按 label 已加载」与「按路径加载」两种历史状态，避免重复加载失败"""
+    uid = os.getuid() if hasattr(os, "getuid") else 0
+    subprocess.run(["launchctl", "bootout", f"gui/{uid}/{LAUNCHD_LABEL}"], capture_output=True)
+    if path and os.path.exists(path):
+        subprocess.run(["launchctl", "unload", path], capture_output=True)
+
+
+def _launchd_load(path):
+    uid = os.getuid() if hasattr(os, "getuid") else 0
+    res = subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", path],
+                         capture_output=True, text=True, errors="replace")
+    if res.returncode != 0:
+        res = subprocess.run(["launchctl", "load", path], capture_output=True, text=True, errors="replace")
+    return res
+
+
+def _install_launchd(mode):
+    cli = scheduler_cli_command()
+    args_xml = "\n".join(f"        <string>{xml_escape(c)}</string>" for c in cli + ["checkin", "--all"])
+    calendar_xml = ""
+    if mode == "calendar":
+        calendar_xml = (
+            "    <key>StartCalendarInterval</key>\n"
+            "    <dict>\n"
+            "        <key>Hour</key>\n"
+            "        <integer>9</integer>\n"
+            "        <key>Minute</key>\n"
+            "        <integer>5</integer>\n"
+            "    </dict>\n"
+        )
+    plist_content = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+        '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+        '<plist version="1.0">\n'
+        "<dict>\n"
+        "    <key>Label</key>\n"
+        f"    <string>{LAUNCHD_LABEL}</string>\n"
+        "    <key>ProgramArguments</key>\n"
+        "    <array>\n"
+        f"{args_xml}\n"
+        "    </array>\n"
+        f"{calendar_xml}"
+        "    <key>StandardOutPath</key>\n"
+        f"    <string>{xml_escape(os.path.join(LOGS_DIR, 'scheduler.out.log'))}</string>\n"
+        "    <key>StandardErrorPath</key>\n"
+        f"    <string>{xml_escape(os.path.join(LOGS_DIR, 'scheduler.err.log'))}</string>\n"
+        "    <key>RunAtLoad</key>\n"
+        f"    <{'true' if mode == 'boot' else 'false'}/>\n"
+        "</dict>\n"
+        "</plist>\n"
+    )
+
+    path = launchd_plist_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    os.makedirs(LOGS_DIR, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(plist_content)
+    _launchd_unload_any(path)
+    res = _launchd_load(path)
+    if res.returncode != 0:
+        print(f"{COLOR_RED}✘ launchctl load 失败: {(res.stderr or res.stdout).strip()}{COLOR_RESET}")
+        return EXIT_ERROR
+    return EXIT_OK
+
+
+def _install_systemd(mode):
+    cli = scheduler_cli_command()
+    unit_dir = systemd_user_dir()
+    os.makedirs(unit_dir, exist_ok=True)
+    os.makedirs(LOGS_DIR, exist_ok=True)
+
+    exec_start = " ".join(f'"{c}"' if " " in c else c for c in cli) + " checkin --all"
+    service = (
+        "[Unit]\n"
+        "Description=MiniMax Code Automated Multi-Account Daily Check-in\n"
+        "After=network-online.target\n"
+        "Wants=network-online.target\n\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        f"ExecStart={exec_start}\n"
+        f"StandardOutput=append:{os.path.join(LOGS_DIR, 'scheduler.out.log')}\n"
+        f"StandardError=append:{os.path.join(LOGS_DIR, 'scheduler.err.log')}\n\n"
+        "[Install]\n"
+        "WantedBy=default.target\n"
+    )
+    if mode == "calendar":
+        timer_body = "OnCalendar=*-*-* 09:05:00\nPersistent=true\n"
+        description = "MiniMax Code Daily Check-in Timer (Everyday at 09:05)"
+    else:
+        timer_body = "OnBootSec=3min\nOnUnitActiveSec=6h\n"
+        description = "MiniMax Code Check-in Timer (Boot + every 6h)"
+
+    timer = (
+        "[Unit]\n"
+        f"Description={description}\n\n"
+        "[Timer]\n"
+        f"{timer_body}\n"
+        "[Install]\n"
+        "WantedBy=timers.target\n"
+    )
+    with open(os.path.join(unit_dir, f"{SYSTEMD_UNIT}.service"), "w", encoding="utf-8") as f:
+        f.write(service)
+    with open(os.path.join(unit_dir, f"{SYSTEMD_UNIT}.timer"), "w", encoding="utf-8") as f:
+        f.write(timer)
+
+    if not shutil.which("systemctl"):
+        print(f"{COLOR_YELLOW}△ 未检测到 systemctl，unit 文件已写入但未激活。{COLOR_RESET}")
+        print(f"  • 手动激活: systemctl --user daemon-reload && systemctl --user enable --now {SYSTEMD_UNIT}.timer")
+        return EXIT_OK
+
+    subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True, text=True, errors="replace")
+    res = subprocess.run(["systemctl", "--user", "enable", "--now", f"{SYSTEMD_UNIT}.timer"],
+                         capture_output=True, text=True, errors="replace")
+    if res.returncode != 0:
+        print(f"{COLOR_RED}✘ systemctl --user enable 失败: {(res.stderr or res.stdout).strip()}{COLOR_RESET}")
+        print(f"{COLOR_DIM}提示: 若在 SSH/容器中运行，可能需要先执行 loginctl enable-linger $USER{COLOR_RESET}")
+        return EXIT_ERROR
+    return EXIT_OK
+
+
+def _install_windows_task(mode):
+    cli = scheduler_cli_command()
+    task_name = WINDOWS_TASK_CALENDAR if mode == "calendar" else WINDOWS_TASK_BOOT
+    # 清理另一种模式，避免双任务重复打卡
+    other = WINDOWS_TASK_BOOT if mode == "calendar" else WINDOWS_TASK_CALENDAR
+    subprocess.run(["schtasks", "/delete", "/tn", other, "/f"], capture_output=True)
+
+    exe = " ".join(f'"{c}"' for c in cli)
+    command = f'{exe} checkin --all'
+    if mode == "calendar":
+        cmd = ["schtasks", "/create", "/tn", task_name, "/tr", command, "/sc", "daily", "/st", "09:05", "/f"]
+    else:
+        cmd = ["schtasks", "/create", "/tn", task_name, "/tr", command, "/sc", "onlogon", "/f"]
+
+    res = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+    if res.returncode != 0:
+        print(f"{COLOR_RED}✘ 计划任务创建失败: {(res.stderr or res.stdout).strip()}{COLOR_RESET}")
+        return EXIT_ERROR
+    return EXIT_OK
+
+
+def cmd_cron(args):
+    action = (positional_args(args) or ["status"])[0]
+    mode = flag_value(args, "--mode", None)
+    if mode is None:
+        mode = "boot" if has_flag(args, "--boot") else "calendar"
+    mode = str(mode).lower()
+    if mode not in ("calendar", "boot"):
+        print(f"{COLOR_RED}错误: 未知调度模式 [{mode}]，仅支持 calendar / boot。{COLOR_RESET}")
+        return EXIT_USAGE
+
+    if action in ("install", "setup", "enable"):
+        if sys.platform == "darwin":
+            rc = _install_launchd(mode)
+        elif sys.platform.startswith("linux"):
+            rc = _install_systemd(mode)
+        elif sys.platform == "win32":
+            rc = _install_windows_task(mode)
+        else:
+            print(f"{COLOR_RED}✘ 不支持的平台: {sys.platform}{COLOR_RESET}")
+            return EXIT_ERROR
+
+        if rc == EXIT_OK:
+            label = "每日 09:05 自动执行" if mode == "calendar" else "开机/登录后自动执行（并每 6 小时兜底）"
+            print(f"{COLOR_GREEN}✔ 定时打卡服务已安装！{COLOR_RESET}")
+            print(f"  • 调度模式: {mode} ({label})")
+            print(f"  • 执行命令: minimax checkin --all")
+            print(f"  • 审计日志: {CHECKIN_LOG_PATH}")
+            print(f"  • 进程日志: {os.path.join(LOGS_DIR, 'scheduler.out.log')}")
+            write_state({"scheduler_mode": mode, "scheduler_installed_at": int(time.time() * 1000)})
+        return rc
+
+    if action in ("uninstall", "remove", "disable"):
+        if sys.platform == "darwin":
+            path = launchd_plist_path()
+            if os.path.exists(path):
+                _launchd_unload_any(path)
+                os.remove(path)
+                print(f"{COLOR_GREEN}✔ 已注销并删除 macOS LaunchAgent 定时任务。{COLOR_RESET}")
+            else:
+                print(f"{COLOR_YELLOW}未发现已安装的 LaunchAgent。{COLOR_RESET}")
+        elif sys.platform.startswith("linux"):
+            removed = False
+            if shutil.which("systemctl"):
+                subprocess.run(["systemctl", "--user", "disable", "--now", f"{SYSTEMD_UNIT}.timer"], capture_output=True)
+            for name in (f"{SYSTEMD_UNIT}.service", f"{SYSTEMD_UNIT}.timer"):
+                path = os.path.join(systemd_user_dir(), name)
+                if os.path.exists(path):
+                    os.remove(path)
+                    removed = True
+            if shutil.which("systemctl"):
+                subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+            if removed:
+                print(f"{COLOR_GREEN}✔ 已停用并删除 systemd user timer。{COLOR_RESET}")
+            else:
+                print(f"{COLOR_YELLOW}未发现已安装的 systemd user timer。{COLOR_RESET}")
+        elif sys.platform == "win32":
+            removed = False
+            for name in (WINDOWS_TASK_CALENDAR, WINDOWS_TASK_BOOT):
+                res = subprocess.run(["schtasks", "/delete", "/tn", name, "/f"], capture_output=True, text=True, errors="replace")
+                if res.returncode == 0:
+                    removed = True
+            if removed:
+                print(f"{COLOR_GREEN}✔ 已删除 Windows 计划任务。{COLOR_RESET}")
+            else:
+                print(f"{COLOR_YELLOW}未发现已安装的 Windows 计划任务。{COLOR_RESET}")
+        else:
+            print(f"{COLOR_RED}✘ 不支持的平台: {sys.platform}{COLOR_RESET}")
+            return EXIT_ERROR
+        return EXIT_OK
+
+    if action in ("status", "info", "check"):
+        info = detect_scheduler()
+        print(f"\n{COLOR_BOLD}{COLOR_CYAN}=== 定时打卡服务状态 ==={COLOR_RESET}")
+        print(f"  • 平台:     {sys.platform}")
+        print(f"  • 已安装:   {'是' if info['installed'] else '否'}")
+        print(f"  • 调度模式: {info['mode'] or '未配置'}")
+        print(f"  • 已激活:   {'是' if info['active'] else '否'}")
+        print(f"  • 详情:     {info['detail']}")
+
+        state = read_state()
+        last = state.get("last_run_at")
+        print(f"  • 最近执行: {format_timestamp(last) if last else '暂无记录'}")
+        if info["installed"] and not info["active"]:
+            print(f"\n  {COLOR_RED}✘ 服务已安装但未激活，请重新执行: minimax cron install{COLOR_RESET}")
+            return EXIT_ERROR
+        if not info["installed"]:
+            print(f"\n  {COLOR_YELLOW}△ 尚未安装定时服务，运行: minimax cron install{COLOR_RESET}")
+            return EXIT_ERROR
+        print(f"\n  {COLOR_GREEN}✔ 定时打卡服务运行正常。{COLOR_RESET}\n")
+        return EXIT_OK
+
+    print(f"{COLOR_RED}未知操作: {action}。可用: install / uninstall / status{COLOR_RESET}")
+    return EXIT_USAGE
+
 
 # -----------------------------------------------------------------------------
 # 命令实现：诊断与健康体检 (`minimax doctor`)
 # -----------------------------------------------------------------------------
-def cmd_doctor():
-    print(f"\n{COLOR_BOLD}{COLOR_CYAN}=== MiniMax Toolkit 运行时自检诊断报告 (Doctor) ==={COLOR_RESET}")
-    print(f"  • Python 运行时:   {sys.version.split()[0]} ({sys.executable})")
-    print(f"  • 操作系统平台:    {sys.platform}")
-    print(f"  • 用户家目录:      {HOME}")
-    print(f"  • Toolkit 目录:    {MINIMAX_DIR}")
+def gateway_probe():
+    try:
+        req = urllib.request.Request(f"{GATEWAY_BASE}/minimax-cloud/api/v1/signin/status")
+        req.add_header("User-Agent", "MiniMaxAgent Mozilla/5.0")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return True, f"HTTP {resp.status}"
+    except urllib.error.HTTPError as he:
+        return True, f"HTTP {he.code}"
+    except Exception as e:
+        return False, sanitize_token(e)
+
+
+def cmd_doctor(args):
+    as_json = has_flag(args, "--json")
+    offline = has_flag(args, "--offline", "--no-network")
+    checks = []
+
+    def add(name, status, detail):
+        checks.append({"name": name, "status": status, "detail": detail})
+
+    py_ver = ".".join(str(x) for x in sys.version_info[:3])
+    add("python", "ok" if sys.version_info[:2] >= MIN_PYTHON else "fail",
+        f"{py_ver} ({sys.executable})")
+
+    try:
+        os.makedirs(MINIMAX_DIR, exist_ok=True)
+        os.makedirs(AUTH_PROFILES_DIR, exist_ok=True)
+        writable = os.access(MINIMAX_DIR, os.W_OK)
+    except Exception:
+        writable = False
+    add("home", "ok" if writable else "fail", f"{MINIMAX_DIR} ({'可写' if writable else '不可写'})")
 
     profiles = list_profiles()
-    print(f"  • 纳管账号数量:    {len(profiles)} 个 ({', '.join(profiles) if profiles else '无'})")
+    add("profiles", "ok" if profiles else "warn",
+        f"{len(profiles)} 个账号 ({', '.join(profiles) if profiles else '无'})")
 
+    active_info = {"alias": None, "expires_at_ms": 0, "generation": 0, "expired": True}
     if os.path.exists(ACTIVE_AUTH_PATH):
         active = load_json(ACTIVE_AUTH_PATH)
         rec_key, rec = get_record_from_auth(active)
-        meta = extract_account_meta(rec)
-        print(f"  • 活跃凭据状态:    {COLOR_GREEN}已挂载{COLOR_RESET} (UID: {meta['userId']}, 代数: {meta['generation']})")
-        print(f"  • 凭据落盘路径:    {ACTIVE_AUTH_PATH}")
-    else:
-        print(f"  • 活跃凭据状态:    {COLOR_YELLOW}未初始化 (不存在: {ACTIVE_AUTH_PATH}){COLOR_RESET}")
-
-    if sys.platform == "darwin":
-        plist = os.path.join(HOME, "Library", "LaunchAgents", "com.minimax.dailycheckin.plist")
-        if os.path.exists(plist):
-            res = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
-            loaded = "com.minimax.dailycheckin" in res.stdout
-            print(f"  • 定时打卡服务:    {COLOR_GREEN}已安装{COLOR_RESET} (LaunchAgent: {'已激活加载' if loaded else '未激活'})")
+        if rec:
+            meta = extract_account_meta(rec)
+            active_info = {
+                "alias": (active or {}).get("_toolkit_alias") or get_current_alias(),
+                "expires_at_ms": meta["expiresAtMs"],
+                "generation": meta["generation"],
+                "expired": meta["expiresAtMs"] < int(time.time() * 1000),
+            }
+            add("active_auth", "warn" if active_info["expired"] else "ok",
+                f"[{active_info['alias'] or '?'}] Gen {active_info['generation']}, 到期 {format_timestamp(active_info['expires_at_ms'])}")
         else:
-            print(f"  • 定时打卡服务:    {COLOR_YELLOW}未配置 (运行: minimax cron install 即可安装){COLOR_RESET}")
-
-    print(f"  • 网关连通性测试:  ", end="", flush=True)
-    try:
-        req = urllib.request.Request(f"{GATEWAY_BASE}/minimax-cloud/api/v1/signin/status")
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            pass
-        print(f"{COLOR_GREEN}正常 (HTTP 200/可达){COLOR_RESET}")
-    except urllib.error.HTTPError as he:
-        print(f"{COLOR_GREEN}正常 (网关链路畅通, HTTP {he.code}){COLOR_RESET}")
-    except Exception as e:
-        print(f"{COLOR_RED}异常 ({e}){COLOR_RESET}")
-
-    print(f"\n{COLOR_GREEN}✔ 诊断完成，核心环境健康。{COLOR_RESET}\n")
-    return 0
-
-# -----------------------------------------------------------------------------
-# 命令实现：定时任务纳管 (`minimax cron [install|uninstall]`)
-# -----------------------------------------------------------------------------
-def cmd_cron(action="install"):
-    if sys.platform != "darwin":
-        print(f"{COLOR_YELLOW}目前一键 cron 管理仅原生支持 macOS launchd，Linux 请使用 systemd 模板。{COLOR_RESET}")
-        return 0
-
-    plist_path = os.path.join(HOME, "Library", "LaunchAgents", "com.minimax.dailycheckin.plist")
-    os.makedirs(os.path.dirname(plist_path), exist_ok=True)
-    bin_path = os.path.join(HOME, ".local", "bin", "minimax")
-    if not os.path.exists(bin_path):
-        bin_path = os.path.abspath(__file__)
-
-    if action in ("install", "setup"):
-        escaped_bin = xml.sax.saxutils.escape(bin_path, {'"': '&quot;', "'": '&apos;'})
-        escaped_log = xml.sax.saxutils.escape(CHECKIN_LOG_PATH, {'"': '&quot;', "'": '&apos;'})
-        plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.minimax.dailycheckin</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{escaped_bin}</string>
-        <string>checkin</string>
-        <string>--all</string>
-    </array>
-    <key>StartCalendarInterval</key>
-    <dict>
-        <key>Hour</key>
-        <integer>9</integer>
-        <key>Minute</key>
-        <integer>5</integer>
-    </dict>
-    <key>StandardOutPath</key>
-    <string>{escaped_log}</string>
-    <key>StandardErrorPath</key>
-    <string>{escaped_log}</string>
-    <key>RunAtLoad</key>
-    <false/>
-</dict>
-</plist>
-"""
-        with open(plist_path, "w", encoding="utf-8") as f:
-            f.write(plist_content)
-        subprocess.run(["launchctl", "unload", plist_path], capture_output=True)
-        subprocess.run(["launchctl", "load", plist_path], capture_output=True)
-        print(f"{COLOR_GREEN}✔ macOS LaunchAgent 定时打卡服务已安装！{COLOR_RESET}")
-        print(f"  • 调度周期: 每日 09:05:00 自动执行: minimax checkin --all")
-        print(f"  • 日志文件: {CHECKIN_LOG_PATH}")
-        return 0
-    elif action in ("uninstall", "remove"):
-        if os.path.exists(plist_path):
-            subprocess.run(["launchctl", "unload", plist_path], capture_output=True)
-            try:
-                os.remove(plist_path)
-            except Exception:
-                pass
-            print(f"{COLOR_GREEN}✔ 已注销并删除 macOS LaunchAgent 定时任务。{COLOR_RESET}")
-        else:
-            print(f"{COLOR_YELLOW}未发现已安装的 LaunchAgent。{COLOR_RESET}")
-        return 0
+            add("active_auth", "fail", f"凭据文件无有效 OAuth 记录: {ACTIVE_AUTH_PATH}")
     else:
-        print(f"未知操作: {action}。可用选项: install / uninstall")
-        return 1
+        add("active_auth", "warn", f"未初始化 (不存在: {ACTIVE_AUTH_PATH})")
+
+    scheduler = detect_scheduler()
+    if scheduler["installed"] and scheduler["active"]:
+        add("scheduler", "ok", f"{scheduler['mode']} / {scheduler['detail']}")
+    elif scheduler["installed"]:
+        add("scheduler", "fail", scheduler["detail"])
+    else:
+        add("scheduler", "warn", "未安装（运行: minimax cron install）")
+
+    state = read_state()
+    last_run = state.get("last_run_at") or 0
+    last_success = state.get("last_success_at") or 0
+    now_ms = int(time.time() * 1000)
+    if not last_run:
+        add("last_checkin", "warn", "暂无执行记录")
+    else:
+        age_h = (now_ms - last_run) / 3600000.0
+        success_age_h = (now_ms - last_success) / 3600000.0 if last_success else None
+        detail = f"最近执行 {format_timestamp(last_run)} ({age_h:.1f}h 前), 结果={state.get('last_run_result')}"
+        if last_success:
+            detail += f", 最近成功 {success_age_h:.1f}h 前"
+        if success_age_h is not None and success_age_h > 36:
+            add("last_checkin", "fail", detail + " | 超过 36 小时未成功打卡")
+        elif age_h > 26:
+            add("last_checkin", "warn", detail + " | 超过 26 小时未执行，检查调度器")
+        else:
+            add("last_checkin", "ok", detail)
+
+    if offline:
+        add("gateway", "warn", "已跳过网络探测 (--offline)")
+    else:
+        reachable, probe_detail = gateway_probe()
+        add("gateway", "ok" if reachable else "fail", f"{GATEWAY_BASE} ({probe_detail})")
+
+    on_path = bool(shutil.which("minimax") or shutil.which("minimax.cmd"))
+    add("path", "ok" if on_path else "warn",
+        "minimax 已在 PATH 中" if on_path else "minimax 不在 PATH 中（重开终端或手动加入 PATH）")
+
+    healthy = all(c["status"] != "fail" for c in checks)
+
+    if as_json:
+        print(json.dumps({
+            "version": VERSION,
+            "platform": sys.platform,
+            "python": py_ver,
+            "minimax_dir": MINIMAX_DIR,
+            "profiles": profiles,
+            "current": get_current_alias(),
+            "active_auth": active_info,
+            "scheduler": scheduler,
+            "state": state,
+            "checks": checks,
+            "healthy": healthy,
+        }, ensure_ascii=False, indent=2))
+        return EXIT_OK if healthy else EXIT_ERROR
+
+    print(f"\n{COLOR_BOLD}{COLOR_CYAN}=== MiniMax Toolkit 运行时自检诊断报告 (Doctor) ==={COLOR_RESET}")
+    print(f"  • Toolkit 版本:    {VERSION}")
+    print(f"  • 操作系统平台:    {sys.platform}")
+    print(f"  • 用户家目录:      {HOME}")
+    icons = {"ok": f"{COLOR_GREEN}✔{COLOR_RESET}", "warn": f"{COLOR_YELLOW}△{COLOR_RESET}", "fail": f"{COLOR_RED}✘{COLOR_RESET}"}
+    labels = {"python": "Python 运行时", "home": "运行目录", "profiles": "纳管账号",
+              "active_auth": "活跃凭据", "scheduler": "定时服务", "last_checkin": "最近打卡",
+              "gateway": "网关连通性", "path": "命令可用性"}
+    for c in checks:
+        print(f"  {icons[c['status']]} {pad(labels.get(c['name'], c['name']), 12)} {c['detail']}")
+
+    if healthy:
+        print(f"\n{COLOR_GREEN}✔ 诊断完成，核心环境健康。{COLOR_RESET}\n")
+        return EXIT_OK
+    print(f"\n{COLOR_RED}✘ 诊断发现需要处理的问题，请按上方提示修复。{COLOR_RESET}\n")
+    return EXIT_ERROR
+
 
 # -----------------------------------------------------------------------------
 # CLI 分发入口
@@ -1091,15 +1840,52 @@ https://github.com/FlapPearLabs/minimax-toolkit
 
 {COLOR_BOLD}核心命令用法:{COLOR_RESET}
   {COLOR_GREEN}minimax login [alias]{COLOR_RESET}        通过浏览器拉取 RFC 8628 免扫码授权并绑定新账号
-  {COLOR_GREEN}minimax switch [alias]{COLOR_RESET}       原子切换当前活跃账号 (支持交互式菜单与自动状态回写)
+      选项: --force 覆盖已存在账号 | --no-browser 不自动打开浏览器
+  {COLOR_GREEN}minimax switch [alias]{COLOR_RESET}       原子切换当前活跃账号 (无参时进入交互式菜单)
   {COLOR_GREEN}minimax list{COLOR_RESET}                 列出所有纳管账号、UID、Token 寿命与今日签到状态
-  {COLOR_GREEN}minimax status [alias]{COLOR_RESET}       查询当前或指定账号详细的 7 天连签流水与积分
-  {COLOR_GREEN}minimax checkin [--all]{COLOR_RESET}      执行打卡领积分 (默认单号，--all 轮询全量账号并发打卡)
-  {COLOR_GREEN}minimax audit [--all]{COLOR_RESET}        全面健康体检与 Token 无感滚动续杯 (Rolling Refresh)
-  {COLOR_GREEN}minimax cron [install|un..]{COLOR_RESET} 一键安装/卸载系统级定时打卡服务 (macOS LaunchAgent)
-  {COLOR_GREEN}minimax doctor{COLOR_RESET}               诊断当前凭据挂载状态、网络连通性与运行时健康
-  {COLOR_GREEN}minimax help{COLOR_RESET}                 显示本帮助信息
+      选项: --offline 跳过网络探测 | --json 机器可读输出
+  {COLOR_GREEN}minimax status [alias]{COLOR_RESET}       查询当前或指定账号的 7 天连签流水与积分
+  {COLOR_GREEN}minimax checkin [alias|--all]{COLOR_RESET} 执行打卡领积分 (默认当前账号，--all 轮询全量)
+  {COLOR_GREEN}minimax audit [alias|--all]{COLOR_RESET}   全面健康体检与 Token 无感滚动续杯
+  {COLOR_GREEN}minimax cron <install|uninstall|status>{COLOR_RESET}
+      安装/卸载/查看系统级定时打卡 (launchd / systemd user timer / Windows 计划任务)
+      选项: --mode calendar|boot
+  {COLOR_GREEN}minimax doctor{COLOR_RESET}               诊断凭据、调度器、最近打卡与网络连通性
+      选项: --json 机器可读输出
+  {COLOR_GREEN}minimax version{COLOR_RESET}              显示版本号
+
+{COLOR_DIM}环境变量: MINIMAX_HOME / MINIMAX_ACCOUNT_BASE / MINIMAX_GATEWAY_BASE{COLOR_RESET}
 """)
+
+
+def dispatch(argv):
+    cmd = argv[0].lower() if argv else "help"
+    args = argv[1:]
+
+    handlers = {
+        "login": cmd_login, "auth": cmd_login, "add": cmd_login,
+        "switch": cmd_switch, "use": cmd_switch, "select": cmd_switch,
+        "list": cmd_list, "ls": cmd_list,
+        "status": cmd_status, "info": cmd_status,
+        "checkin": cmd_checkin, "sign": cmd_checkin,
+        "audit": cmd_audit, "refresh": cmd_audit,
+        "doctor": cmd_doctor, "diagnose": cmd_doctor,
+        "cron": cmd_cron, "daemon": cmd_cron, "service": cmd_cron,
+    }
+
+    if cmd in ("help", "--help", "-h"):
+        print_help()
+        return EXIT_OK
+    if cmd in ("version", "--version", "-v"):
+        print(f"minimax-toolkit v{VERSION}")
+        return EXIT_OK
+    if cmd not in handlers:
+        print(f"{COLOR_RED}未知命令: {cmd}{COLOR_RESET}")
+        print_help()
+        return EXIT_USAGE
+
+    return handlers[cmd](args)
+
 
 def main():
     # 自动识别以别名调用的符号链接/垫片 (如 mmx-checkin, minimax-login 等)
@@ -1115,40 +1901,29 @@ def main():
 
     if len(sys.argv) < 2:
         print_help()
-        sys.exit(0)
+        sys.exit(EXIT_OK)
 
-    cmd = sys.argv[1].lower()
-    arg = sys.argv[2] if len(sys.argv) > 2 else None
+    try:
+        code = dispatch(sys.argv[1:])
+    except KeyboardInterrupt:
+        print("\n已取消。")
+        code = 130
+    except BrokenPipeError:
+        code = EXIT_OK
+    except Exception as e:
+        # 统一异常边界：绝不让原始回溯污染日志，也不泄露 Token
+        if os.environ.get("MINIMAX_DEBUG") == "1":
+            import traceback
+            traceback.print_exc()
+        log(f"{COLOR_RED}✘ 执行失败: {type(e).__name__}: {sanitize_token(e)}{COLOR_RESET}")
+        code = EXIT_INTERNAL
 
-    if cmd in ("login", "auth", "add"):
-        sys.exit(cmd_login(arg))
-    elif cmd in ("switch", "use", "select"):
-        sys.exit(cmd_switch(arg))
-    elif cmd in ("list", "ls"):
-        sys.exit(cmd_list())
-    elif cmd in ("status", "info"):
-        sys.exit(cmd_status(arg))
-    elif cmd in ("checkin", "sign"):
-        target = arg or "--all"
-        sys.exit(cmd_checkin(target))
-    elif cmd in ("audit", "refresh"):
-        target = arg or "--all"
-        sys.exit(cmd_audit(target))
-    elif cmd in ("doctor", "diagnose"):
-        sys.exit(cmd_doctor())
-    elif cmd in ("cron", "daemon", "service"):
-        action = arg or "install"
-        sys.exit(cmd_cron(action))
-    elif cmd in ("help", "--help", "-h"):
-        print_help()
-        sys.exit(0)
-    elif cmd in ("version", "--version", "-v"):
-        print(f"minimax-toolkit v{VERSION}")
-        sys.exit(0)
-    else:
-        print(f"{COLOR_RED}未知命令: {cmd}{COLOR_RESET}")
-        print_help()
-        sys.exit(1)
+    try:
+        sys.stdout.flush()
+    except Exception:
+        pass
+    sys.exit(code)
+
 
 if __name__ == "__main__":
     main()

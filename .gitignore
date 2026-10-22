@@ -8,3 +8,5 @@ auth.json
 *.info
 *.tmp*
 auth_profiles/
+state.json
+.pytest_cache/
