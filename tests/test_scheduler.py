@@ -70,7 +70,8 @@ class TestSchedulerGeneration(unittest.TestCase):
         self.assertIn("&quot;", content)
 
     def test_systemd_calendar_units(self):
-        with patch("minimax.shutil.which", return_value=None), \
+        with patch.dict(os.environ, {"MINIMAX_HOME": "/opt/mmx sandbox"}), \
+             patch("minimax.shutil.which", return_value=None), \
              patch("minimax.subprocess.run", side_effect=ok_run):
             rc = mmx._install_systemd("calendar")
         self.assertEqual(rc, mmx.EXIT_OK)
@@ -84,6 +85,18 @@ class TestSchedulerGeneration(unittest.TestCase):
         self.assertNotIn("checkin.log", service)
         self.assertIn("OnCalendar=*-*-* 09:05:00", timer)
         self.assertIn("Persistent=true", timer)
+        # systemd user manager 的 PATH 是固定的，必须显式补齐解释器目录，否则 pyenv/conda 下 127
+        self.assertIn("Environment=\"PATH=", service)
+        self.assertIn(os.path.dirname(sys.executable), service)
+        self.assertIn('Environment="MINIMAX_HOME=/opt/mmx sandbox"', service)
+
+    def test_systemd_units_follow_xdg_config_home(self):
+        xdg = os.path.join(self.temp_home, "xdg")
+        with patch.dict(os.environ, {"XDG_CONFIG_HOME": xdg}), \
+             patch("minimax.shutil.which", return_value=None), \
+             patch("minimax.subprocess.run", side_effect=ok_run):
+            mmx._install_systemd("calendar")
+        self.assertTrue(os.path.exists(os.path.join(xdg, "systemd", "user", f"{mmx.SYSTEMD_UNIT}.timer")))
 
     def test_systemd_boot_units(self):
         with patch("minimax.shutil.which", return_value=None), \
@@ -118,6 +131,8 @@ class TestSchedulerGeneration(unittest.TestCase):
         self.assertEqual(rc, mmx.EXIT_OK)
         created = [c for c in calls if "/create" in c]
         self.assertEqual(len(created), 1)
+        # 先建后删：创建之前不得删除另一种模式的可用任务
+        self.assertIn("/create", calls[0])
         cmd = created[0]
         self.assertIn("/sc", cmd)
         self.assertIn("daily", cmd)

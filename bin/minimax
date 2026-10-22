@@ -338,34 +338,35 @@ def atomic_save_json(path, data):
     os.makedirs(target_dir, exist_ok=True)
     tmp_path = f"{target_abs}.tmp.{os.getpid()}_{secrets.token_hex(4)}"
 
-    if sys.platform != "win32":
-        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        try:
+    try:
+        if sys.platform != "win32":
+            fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with open(fd, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
                 f.flush()
                 os.fsync(f.fileno())
-        except Exception:
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
-            raise
-    else:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-            f.flush()
-            os.fsync(f.fileno())
+        else:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
 
-    # 跨平台原子覆盖 (Windows 下防御杀毒软件短时独占句柄冲突)
-    for attempt in range(5):
+        # 跨平台原子覆盖 (Windows 下防御杀毒软件 / SMB 短时独占句柄冲突)
+        for attempt in range(10):
+            try:
+                os.replace(tmp_path, target_abs)
+                break
+            except PermissionError:
+                if attempt == 9:
+                    raise
+                time.sleep(0.2)
+    except Exception:
         try:
-            os.replace(tmp_path, target_abs)
-            break
-        except PermissionError:
-            if attempt == 4:
-                raise
-            time.sleep(0.05)
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        raise
 
 
 def get_record_from_auth(auth_data):
@@ -1396,7 +1397,8 @@ def launchd_plist_path():
 
 
 def systemd_user_dir():
-    return os.path.join(HOME, ".config", "systemd", "user")
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config")
+    return os.path.join(base, "systemd", "user")
 
 
 def detect_scheduler():
@@ -1444,15 +1446,25 @@ def detect_scheduler():
 
     if sys.platform == "win32":
         active_names = []
+        disabled_names = []
         for name in (WINDOWS_TASK_CALENDAR, WINDOWS_TASK_BOOT):
-            res = subprocess.run(["schtasks", "/query", "/tn", name], capture_output=True, text=True, errors="replace")
-            if res.returncode == 0:
+            res = subprocess.run(["schtasks", "/query", "/tn", name, "/xml"],
+                                 capture_output=True, text=True, errors="replace")
+            if res.returncode != 0:
+                continue
+            xml = (res.stdout or "").lower()
+            if "<enabled>true</enabled>" in xml:
                 active_names.append(name)
-        info["installed"] = bool(active_names)
+            else:
+                disabled_names.append(name)
+        info["installed"] = bool(active_names or disabled_names)
         if active_names:
             info["active"] = True
             info["mode"] = "calendar" if WINDOWS_TASK_CALENDAR in active_names else "boot"
             info["detail"] = f"计划任务: {', '.join(active_names)}"
+        elif disabled_names:
+            info["mode"] = "calendar" if WINDOWS_TASK_CALENDAR in disabled_names else "boot"
+            info["detail"] = f"计划任务已存在但被禁用: {', '.join(disabled_names)}"
         else:
             info["detail"] = "未找到 MiniMax 计划任务"
         return info
@@ -1492,6 +1504,15 @@ def _install_launchd(mode):
             "        <integer>5</integer>\n"
             "    </dict>\n"
         )
+    env_xml = ""
+    if os.environ.get("MINIMAX_HOME"):
+        env_xml = (
+            "    <key>EnvironmentVariables</key>\n"
+            "    <dict>\n"
+            "        <key>MINIMAX_HOME</key>\n"
+            f"        <string>{xml_escape(os.environ['MINIMAX_HOME'])}</string>\n"
+            "    </dict>\n"
+        )
     plist_content = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
@@ -1505,6 +1526,7 @@ def _install_launchd(mode):
         f"{args_xml}\n"
         "    </array>\n"
         f"{calendar_xml}"
+        f"{env_xml}"
         "    <key>StandardOutPath</key>\n"
         f"    <string>{xml_escape(os.path.join(LOGS_DIR, 'scheduler.out.log'))}</string>\n"
         "    <key>StandardErrorPath</key>\n"
@@ -1535,6 +1557,13 @@ def _install_systemd(mode):
     os.makedirs(LOGS_DIR, exist_ok=True)
 
     exec_start = " ".join(f'"{c}"' if " " in c else c for c in cli) + " checkin --all"
+    env_lines = []
+    unit_path = (os.path.dirname(sys.executable) + ":" + os.path.join(HOME, ".local", "bin")
+                 + ":" + os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"))
+    env_lines.append(f'Environment="PATH={unit_path}"')
+    if os.environ.get("MINIMAX_HOME"):
+        env_lines.append(f'Environment="MINIMAX_HOME={os.environ["MINIMAX_HOME"]}"')
+    env_block = "\n".join(env_lines) + "\n"
     service = (
         "[Unit]\n"
         "Description=MiniMax Code Automated Multi-Account Daily Check-in\n"
@@ -1542,6 +1571,7 @@ def _install_systemd(mode):
         "Wants=network-online.target\n\n"
         "[Service]\n"
         "Type=oneshot\n"
+        f"{env_block}"
         f"ExecStart={exec_start}\n"
         f"StandardOutput=append:{os.path.join(LOGS_DIR, 'scheduler.out.log')}\n"
         f"StandardError=append:{os.path.join(LOGS_DIR, 'scheduler.err.log')}\n\n"
@@ -1586,9 +1616,7 @@ def _install_systemd(mode):
 def _install_windows_task(mode):
     cli = scheduler_cli_command()
     task_name = WINDOWS_TASK_CALENDAR if mode == "calendar" else WINDOWS_TASK_BOOT
-    # 清理另一种模式，避免双任务重复打卡
     other = WINDOWS_TASK_BOOT if mode == "calendar" else WINDOWS_TASK_CALENDAR
-    subprocess.run(["schtasks", "/delete", "/tn", other, "/f"], capture_output=True)
 
     exe = " ".join(f'"{c}"' for c in cli)
     command = f'{exe} checkin --all'
@@ -1597,10 +1625,12 @@ def _install_windows_task(mode):
     else:
         cmd = ["schtasks", "/create", "/tn", task_name, "/tr", command, "/sc", "onlogon", "/f"]
 
+    # 先建后删：创建失败时不能把用户原有的可用任务也删掉
     res = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
     if res.returncode != 0:
         print(f"{COLOR_RED}✘ 计划任务创建失败: {(res.stderr or res.stdout).strip()}{COLOR_RESET}")
         return EXIT_ERROR
+    subprocess.run(["schtasks", "/delete", "/tn", other, "/f"], capture_output=True)
     return EXIT_OK
 
 
@@ -1661,10 +1691,19 @@ def cmd_cron(args):
                 print(f"{COLOR_YELLOW}未发现已安装的 systemd user timer。{COLOR_RESET}")
         elif sys.platform == "win32":
             removed = False
+            blocked = []
             for name in (WINDOWS_TASK_CALENDAR, WINDOWS_TASK_BOOT):
                 res = subprocess.run(["schtasks", "/delete", "/tn", name, "/f"], capture_output=True, text=True, errors="replace")
                 if res.returncode == 0:
                     removed = True
+                    continue
+                still_there = subprocess.run(["schtasks", "/query", "/tn", name],
+                                             capture_output=True, text=True, errors="replace")
+                if still_there.returncode == 0:
+                    blocked.append(name)
+            if blocked:
+                print(f"{COLOR_RED}✘ 无法删除计划任务（可能权限不足）: {', '.join(blocked)}{COLOR_RESET}")
+                return EXIT_ERROR
             if removed:
                 print(f"{COLOR_GREEN}✔ 已删除 Windows 计划任务。{COLOR_RESET}")
             else:

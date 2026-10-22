@@ -66,7 +66,11 @@ def remove_scheduler():
         unit_dir = os.path.join(HOME, ".config", "systemd", "user")
         removed = False
         if shutil.which("systemctl"):
-            subprocess.run(["systemctl", "--user", "disable", "--now", f"{SYSTEMD_UNIT}.timer"], capture_output=True)
+            res = subprocess.run(["systemctl", "--user", "disable", "--now", f"{SYSTEMD_UNIT}.timer"],
+                                 capture_output=True, text=True, errors="replace")
+            if res.returncode != 0 and os.path.exists(os.path.join(unit_dir, f"{SYSTEMD_UNIT}.timer")):
+                detail = (res.stderr or res.stdout or "").strip()
+                print(f"{COLOR_YELLOW}△ systemctl --user disable 未成功{(': ' + detail) if detail else ''}{COLOR_RESET}")
         for name in (f"{SYSTEMD_UNIT}.service", f"{SYSTEMD_UNIT}.timer"):
             path = os.path.join(unit_dir, name)
             if os.path.exists(path):
@@ -85,7 +89,7 @@ def remove_scheduler():
         removed = False
         for name in WINDOWS_TASKS:
             res = subprocess.run(["schtasks", "/delete", "/tn", name, "/f"],
-                                 capture_output=True, text=True, errors="replace")
+                                 capture_output=True, text=True, encoding="utf-8", errors="replace")
             if res.returncode == 0:
                 removed = True
         if removed:
@@ -164,10 +168,17 @@ def remove_cli():
 def purge_data():
     norm_home = os.path.abspath(HOME)
     norm_mmx = os.path.abspath(MINIMAX_DIR)
-    # 严格安全边界检查：仅允许删除 HOME 之下的 ~/.minimax
+    # 严格安全边界检查：仅允许删除 HOME 之下的目录
     if not (norm_mmx.startswith(norm_home + os.sep) and norm_mmx != norm_home):
         print(f"{COLOR_RED}✘ 安全校验拒绝清理越界路径: {norm_mmx}{COLOR_RESET}")
-        return
+        return False
+    # 目录指纹校验：MINIMAX_HOME 可能被指向普通工程目录，绝不能盲删其中的 bin/ 与 logs/
+    markers = [os.path.join(MINIMAX_DIR, "auth_profiles"),
+               os.path.join(MINIMAX_DIR, "auth"),
+               STATE_PATH]
+    if not any(os.path.exists(m) for m in markers):
+        print(f"{COLOR_YELLOW}△ {MINIMAX_DIR} 未发现 MiniMax Toolkit 数据指纹，跳过 --purge 清理。{COLOR_RESET}")
+        return False
 
     for sub in (AUTH_PROFILES_DIR, LOGS_DIR, os.path.join(MINIMAX_DIR, "auth"),
                 os.path.join(MINIMAX_DIR, "bin")):
@@ -184,6 +195,7 @@ def purge_data():
     except Exception:
         pass
     print(f"{COLOR_YELLOW}✔ 已按 --purge 要求彻底清理多账号凭据、日志及运行时状态{COLOR_RESET}")
+    return True
 
 
 def uninstall():

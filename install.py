@@ -71,21 +71,23 @@ def is_same_path(p1, p2):
 
 
 def _windows_cmd_wrapper():
-    # 优先 py -3，其次 python3，最后 python（避开 Windows Store 假别名）
+    # 优先 py -3，其次 python3，最后 python（避开 Windows Store 假别名）。
+    # 关键：必须用 goto 而非 if(...) 块——cmd 会在解析整块时展开 %ERRORLEVEL%，
+    # 那样子进程失败也会返回 0，Task Scheduler 永远看到成功。
     return (
         "@echo off\r\n"
         "setlocal\r\n"
         "where py >nul 2>nul\r\n"
-        "if %ERRORLEVEL% equ 0 (\r\n"
-        "    py -3 \"%~dp0minimax\" %*\r\n"
-        "    exit /b %ERRORLEVEL%\r\n"
-        ")\r\n"
+        "if %ERRORLEVEL% equ 0 goto :mmx_py\r\n"
         "where python3 >nul 2>nul\r\n"
-        "if %ERRORLEVEL% equ 0 (\r\n"
-        "    python3 \"%~dp0minimax\" %*\r\n"
-        "    exit /b %ERRORLEVEL%\r\n"
-        ")\r\n"
+        "if %ERRORLEVEL% equ 0 goto :mmx_py3\r\n"
         "python \"%~dp0minimax\" %*\r\n"
+        "exit /b %ERRORLEVEL%\r\n"
+        ":mmx_py\r\n"
+        "py -3 \"%~dp0minimax\" %*\r\n"
+        "exit /b %ERRORLEVEL%\r\n"
+        ":mmx_py3\r\n"
+        "python3 \"%~dp0minimax\" %*\r\n"
         "exit /b %ERRORLEVEL%\r\n"
     )
 
@@ -145,6 +147,7 @@ def install_cli():
         shutil.copy2(src_bin, dest_bin)
     os.chmod(dest_bin, 0o755)
 
+    link_failures = 0
     for alias in ALIASES:
         link_path = os.path.join(bin_dir, alias)
         if is_same_path(link_path, dest_bin):
@@ -157,16 +160,19 @@ def install_cli():
         try:
             os.symlink("minimax", link_path)
         except Exception:
-            pass
+            link_failures += 1
 
     print(f"{COLOR_GREEN}✔ CLI 主程序及快捷软链已安装至: {bin_dir}{COLOR_RESET}")
+    if link_failures:
+        print(f"{COLOR_YELLOW}△ 有 {link_failures} 个快捷软链创建失败（文件系统可能不支持 symlink），"
+              f"主命令 minimax 仍可正常使用{COLOR_RESET}")
     return dest_bin, bin_dir
 
 
 def verify_cli(dest_bin):
     """安装后真实性验证：实际执行一次 --version，杜绝「装上但跑不起来」"""
     res = subprocess.run([sys.executable, dest_bin, "--version"],
-                         capture_output=True, text=True, errors="replace")
+                         capture_output=True, text=True, encoding="utf-8", errors="replace")
     if res.returncode != 0:
         print(f"{COLOR_RED}✘ 安装后自检失败: {(res.stderr or res.stdout).strip()}{COLOR_RESET}")
         return False
@@ -197,7 +203,7 @@ def install_services(dest_bin, mode):
 
     # 单一真源：调度逻辑全部收敛在 CLI 的 cron 子命令里
     res = subprocess.run([sys.executable, dest_bin, "cron", "install", "--mode", mode],
-                         capture_output=True, text=True, errors="replace")
+                         capture_output=True, text=True, encoding="utf-8", errors="replace")
     output = (res.stdout or "") + (res.stderr or "")
     print(output.rstrip())
     return res.returncode == 0

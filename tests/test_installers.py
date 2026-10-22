@@ -66,6 +66,18 @@ class TestInstallersLifecycle(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(bin_dir, "mmx")))
             self.assertFalse(os.path.exists(os.path.join(bin_dir, "minimax-checkin")))
 
+    def test_windows_cmd_wrapper_propagates_exit_code(self):
+        """【P1 回归】cmd 的 if(...) 块会在解析期展开 %ERRORLEVEL%，导致永远返回 0"""
+        import importlib.util as _iu
+        spec = _iu.spec_from_file_location("mmx_installer", INSTALLER_PATH)
+        mod = _iu.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        wrapper = mod._windows_cmd_wrapper()
+        self.assertIn("goto :mmx_py", wrapper)
+        self.assertNotIn("if %ERRORLEVEL% equ 0 (", wrapper)
+        # 每个解释器分支后都必须紧跟一次独立的 exit /b %ERRORLEVEL%
+        self.assertEqual(wrapper.count("exit /b %ERRORLEVEL%"), 3)
+
     def test_install_rejects_unknown_checkin_mode(self):
         res = self.run_py(INSTALLER_PATH, "--checkin-mode=hourly")
         self.assertEqual(res.returncode, 1)
@@ -129,6 +141,25 @@ class TestInstallersLifecycle(unittest.TestCase):
         self.assertFalse(os.path.exists(dummy_profile))
         self.assertFalse(os.path.exists(dummy_log))
         self.assertFalse(os.path.exists(state_path))
+
+
+    def test_purge_refuses_directories_without_toolkit_fingerprint(self):
+        """安全边界：MINIMAX_HOME 指向普通工程目录时，--purge 不得删除其中的 bin/ 与 logs/"""
+        project = os.path.join(self.temp_home, "some-project")
+        os.makedirs(os.path.join(project, "bin"))
+        os.makedirs(os.path.join(project, "logs"))
+        keep = os.path.join(project, "bin", "important.sh")
+        with open(keep, "w", encoding="utf-8") as f:
+            f.write("#!/bin/sh\n")
+
+        env = dict(self.env)
+        env["MINIMAX_HOME"] = project
+        res = subprocess.run([sys.executable, UNINSTALLER_PATH, "--purge"],
+                             capture_output=True, text=True, encoding="utf-8",
+                             errors="replace", env=env)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertTrue(os.path.exists(keep))
+        self.assertIn("未发现 MiniMax Toolkit 数据指纹", res.stdout)
 
 
 if __name__ == "__main__":
