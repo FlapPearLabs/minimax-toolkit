@@ -19,5 +19,5 @@ foreach ($candidate in $candidates) {
     exit $LASTEXITCODE
 }
 
-Write-Error "未找到可用的 Python 3，无法执行卸载。"
+Write-Error "No usable Python 3 found, cannot uninstall."
 exit 1

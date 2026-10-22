@@ -1,7 +1,10 @@
 $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 
-# 优先 py -3，其次 python3，最后 python（逐项探针验证，避开 Windows Store 假别名）
+# Prefer the py launcher, then python3, then python. Each candidate is
+# probed by actually printing sys.version_info[0], so the Windows Store
+# execution alias (which opens the Store instead of running Python) is
+# rejected instead of silently "working".
 $candidates = @(
     @{ Exe = "py"; Args = @("-3") },
     @{ Exe = "python3"; Args = @() },
@@ -20,5 +23,5 @@ foreach ($candidate in $candidates) {
     exit $LASTEXITCODE
 }
 
-Write-Error "未找到可用的 Python 3，请先安装 Python 3.8+ 并确保 py / python3 / python 至少一个可用。"
+Write-Error "No usable Python 3 found. Install Python 3.8+ and make sure py, python3 or python is available."
 exit 1
