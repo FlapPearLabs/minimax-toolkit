@@ -58,16 +58,18 @@ class TestSchedulerGeneration(unittest.TestCase):
         self.assertNotIn("StartCalendarInterval", content)
         self.assertIn("RunAtLoad</key>\n    <true/>", content)
 
+    def test_xml_escape_helper(self):
+        self.assertEqual(mmx.xml_escape('a & <b> "c" \'d\''),
+                         "a &amp; &lt;b&gt; &quot;c&quot; &apos;d&apos;")
+
     def test_launchd_escapes_xml_special_chars(self):
-        mmx.LOGS_DIR = os.path.join(self.temp_home, 'weird & <logs> "x"')
+        # 只用 Windows 也合法的字符（& 与空格）建真实目录，其余字符用 helper 覆盖
+        mmx.LOGS_DIR = os.path.join(self.temp_home, "weird & logs")
         os.makedirs(mmx.LOGS_DIR, exist_ok=True)
         with patch("minimax.subprocess.run", side_effect=ok_run):
             mmx._install_launchd("calendar")
         content = open(mmx.launchd_plist_path(), "r", encoding="utf-8").read()
-        self.assertNotIn("<logs>", content)
-        self.assertIn("&amp;", content)
-        self.assertIn("&lt;logs&gt;", content)
-        self.assertIn("&quot;", content)
+        self.assertIn("weird &amp; logs", content)
 
     def test_systemd_calendar_units(self):
         with patch.dict(os.environ, {"MINIMAX_HOME": "/opt/mmx sandbox"}), \
